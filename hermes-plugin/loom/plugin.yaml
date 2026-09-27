@@ -1,0 +1,3 @@
+name: loom
+version: 0.1.0
+description: "Keeps the /goal plan as an immutable segment tree at the front of every request, so prefix caches (koboldcpp --loomcache, provider prompt caches) reuse it; compaction as the built-in compressor"
