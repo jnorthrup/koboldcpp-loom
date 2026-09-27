@@ -20116,10 +20116,17 @@ Current version indicated by LITEVER below.
 				console.log(data);
 				let dropdown = document.getElementById("kcpp_tts_voice");
 					let selectionhtml = ``;
+					//Parrot/Kokoro voice ids look like "af_heart": lang+gender prefix, then name
+					const kokoro_langs = {a:"US",b:"UK",e:"ES",f:"FR",h:"HI",i:"IT",j:"JA",p:"PT-BR",z:"ZH"};
+					const kcpp_voice_label = (v)=>{
+						let m = /^([abefhijpz])([fm])_([a-z]+)$/.exec(v);
+						if(!m) { return v; }
+						return m[3].charAt(0).toUpperCase() + m[3].slice(1) + " (" + kokoro_langs[m[1]] + " " + (m[2]=="f"?"F":"M") + ")";
+					};
 					for (var i = 0; i < data.length; ++i) {
 						// Check for XTTS voices if set
 						let sel = (localsettings.kcpp_tts_voice!=""&&localsettings.kcpp_tts_voice==data[i]);
-						selectionhtml += `<option value="` + data[i] + `"`+(sel?" selected":"")+`>`+data[i]+`</option>`;
+						selectionhtml += `<option value="` + escape_html(data[i]) + `"`+(sel?" selected":"")+`>`+escape_html(kcpp_voice_label(data[i]))+`</option>`;
 					}
 					selectionhtml += `<option value="custom">custom</option><option value="voicejson">voicejson</option>`;
 					dropdown.innerHTML = selectionhtml;
