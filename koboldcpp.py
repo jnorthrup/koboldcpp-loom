@@ -140,6 +140,7 @@ totalgens = 0
 currentusergenkey = "" #store a special key so polled streaming works even in multiuser
 pendingabortkey = "" #if an abort is received for the non-active request, remember it (at least 1) to cancel later
 args = None #global args
+loom_store = None #LoomStore when --loomdir is set
 runmode_untouched = True
 modelfile_extracted_meta = None
 calulated_gpu_overhead = 0 # may be populated at runtime, can also be missing if undetected
@@ -1552,6 +1553,33 @@ def scan_directory(dirpath, valid_exts, depth):
                     files.append(rel_path)
     return files
 
+
+def loomstore_start():
+    """--loomdir: serve /v1/looms (loom script lifecycle + replay artifacts); see loomstore.py."""
+    global loom_store
+    from loomstore import LoomStore
+    scheme = "https" if (args.ssl and sslvalid) else "http"
+    host = args.host if args.host and args.host not in ("0.0.0.0", "::") else "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    loom_store = LoomStore(args.loomdir, f"{scheme}://{host}:{args.port}/v1", log=lambda s: print(s, flush=True))
+    print(f"LoomStore: serving /v1/looms from {loom_store.root}", flush=True)
+
+def loomstore_dispatch(handler, method, clean_path, body):
+    """Serve a /v1/looms request if this is one; returns True when handled."""
+    if loom_store is None or not (clean_path.startswith("/v1/looms") or clean_path.startswith("/looms")):
+        return False
+    if not handler.secure_endpoint():
+        return True
+    result = loom_store.handle(method, clean_path, handler.headers, body)
+    if result is None:
+        return False
+    code, payload, ctype = result
+    handler.send_response(code)
+    handler.send_header('content-length', str(len(payload)))
+    handler.end_headers(content_type=ctype)
+    handler.wfile.write(payload)
+    return True
 
 def get_current_admindir_list():
     opts = []
@@ -6605,6 +6633,8 @@ Change Mode<br>
             return None
 
         clean_path = clean_path.rstrip('/')
+        if loomstore_dispatch(self, "GET", clean_path, None):
+            return
         if clean_path=="/mcp":
             self.send_response(405)
             self.send_header('allow', 'POST')
@@ -7055,6 +7085,9 @@ Change Mode<br>
         clean_path = self.path.split("?")[0] #for cases where we do not want query params
         response_body = None
         response_code = 200
+
+        if loomstore_dispatch(self, "POST", clean_path, body):
+            return
 
         if clean_path.endswith('/api/extra/tokencount') or clean_path.endswith('/api/extra/tokenize'):
             if not self.secure_endpoint():
@@ -8184,6 +8217,13 @@ Change Mode<br>
         self.send_response(404)
         self.end_headers(content_type='text/html')
 
+
+    def do_DELETE(self):
+        clean_path = self.path.split("?")[0].rstrip('/')
+        if loomstore_dispatch(self, "DELETE", clean_path, None):
+            return
+        self.send_response(404)
+        self.end_headers(content_type='text/html')
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -12967,6 +13007,8 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
         else:
             # Flush stdout for previous win32 issue so the client can see output.
             print(f"======\nPlease connect to custom endpoint at {endpoint_url}", flush=True)
+        if args.loomdir:
+            loomstore_start()
         asyncio.run(RunServerMultiThreaded(args.host, args.port, KcppServerRequestHandler))
     else:
         # Flush stdout for previous win32 issue so the client can see output.
@@ -13083,6 +13125,7 @@ if __name__ == '__main__':
     advparser.add_argument("--singleinstance", help="Allows this KoboldCpp instance to be shut down by any new instance requesting the same port, preventing duplicate servers from clashing on a port.", action='store_true')
     advparser.add_argument("--smartcache", help="Enables intelligent context switching by saving KV cache snapshots to RAM. Requires fast forwarding.", metavar=('limit'), nargs='?', const=1, type=int, default=0)
     advparser.add_argument("--loomcache", help="LOOM tree cache: treats SmartCache slots as branches of a prompt prefix tree discovered from the token stream (shared system prompts, fan-outs within fan-outs). Resumes from the longest reusable branch, keeps abandoned branches, and on recurrent models checkpoints fan-out points. Implies --smartcache; set slot count with --smartcache N.", action='store_true')
+    advparser.add_argument("--loomdir", metavar=('[directory]'), help="Serve /v1/looms: store loom scripts (outline trees), run them as depth-first nested loops through this server's chat endpoint, and keep each run as a replayable artifact. Storage is scoped per bearer key. Pairs with --loomcache.", default="")
     advparser.add_argument("--smartcontext", help="Reserving a portion of context to try processing less frequently. Outdated. Not recommended.", action='store_true')
     advparser.add_argument("--splitmode","-sm","--split-mode", help="How to split the model across multiple GPUs", metavar=('[split mode]'), type=str, choices=splitmode_choices, default=splitmode_choices[0])
     advparser.add_argument("--ssl", help="Allows all content to be served over SSL instead. A valid UNENCRYPTED SSL cert and key .pem files must be provided", metavar=('[cert_pem]', '[key_pem]'), nargs='+')

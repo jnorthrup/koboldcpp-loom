@@ -1,0 +1,39 @@
+koboldcpp-loom: loom features
+=============================
+
+--loomcache
+  SmartCache slots become branches of a prompt prefix tree found from the tokens.
+  A request resumes from the deepest branch it shares; the branch it leaves is kept;
+  on recurrent/hybrid models the point where siblings split is snapshotted. No hints.
+  Implies --smartcache (slot count via --smartcache N). Note: SmartCache disables
+  kobold's parallel batching, so --loomcache and --parallelrequests exclude each other.
+
+--loomdir DIR   (/v1/looms, loomstore.py)
+  Lifecycle and artifact storage for loom scripts, the server mate of the Hermes
+  plugin's loop precook (github.com/jnorthrup/loom-hermes-plugin, precook/).
+    POST   /v1/looms                          store a script (content-addressed id)
+    GET    /v1/looms, /v1/looms/{id}          list / read
+    DELETE /v1/looms/{id}                     delete script and runs
+    POST   /v1/looms/{id}/runs                run {prewarm?, request?, replay_of?}
+    GET    /v1/looms/{id}/runs[/{run}]        run status, leaves, usage
+    GET    /v1/looms/{id}/runs/{run}/artifact loom-run/1 JSONL, one request+response per leaf
+    POST   /v1/looms/{id}/runs/{run}/cancel
+  A run walks the outline depth-first as nested loops and sends each leaf through this
+  server's own /v1/chat/completions over loopback, so it takes the normal queue and
+  --loomcache path. Storage is scoped per bearer key (hash of the key). Runs in flight
+  at shutdown are marked interrupted on restart. Frame rendering is loom-frames/1,
+  byte-identical to the plugin's loomframes.py; change both together.
+
+TODO: persistent state (the continuum from "a user's KV cache" to "a GPU's token dump")
+  1 recipe            loom script                    done (/v1/looms)
+  2 run artifact      requests + responses           done (loom-run/1, replay)
+  3 warm process      KV slots in RAM                done (--loomcache; lost on idle-out)
+  4 state file        a loom trunk's KV/state on disk, reloaded instead of re-prefilled
+                      Mechanism: llama_state_get_data/set_data (already used by
+                      SmartCache) written to DIR with a header of model digest, KV
+                      type, context size, token list; refuse to load on any mismatch.
+                      Pays only when moving the bytes beats recomputing the tokens;
+                      unmeasured. Per-account like the scripts.
+  5 shared dump       level 4 files reused across accounts: same mechanism, but only for
+                      public content (tenant isolation).
+  Hosting/billing proposal: runpod experiments/loom/docs/looms-hosting-proposal.md.
