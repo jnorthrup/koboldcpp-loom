@@ -189,6 +189,18 @@ static const int smartcache_rnn_lifeboat_min_prompt_tokens = 2048;
 static const int smartcache_rnn_lifeboat_percent = 65;
 static const int smartcache_rnn_lifeboat_extra_slot_min_user_slots = 4;
 
+//LOOM tree cache: prompts form a prefix tree discovered from the token stream (no caller hints).
+//Every saved slot is a branch; a request resumes from whichever branch shares the longest usable
+//prefix, the leaf it abandons is kept, and on recurrent models (which cannot rewind) the fan-out
+//point where the request leaves a known branch is checkpointed so later siblings resume there.
+static bool loomcache_enabled = false;
+static const int loom_block = 16;     //granularity: gains/leaves shorter than this are not worth a slot
+static const int loom_min_fork = 64;  //do not checkpoint trivially short trunks
+static int loom_fork_target = -1;     //recurrent only: n_past at which to checkpoint during prefill
+static int loom_fork_exclude = -1;    //slot holding the leaf just saved; never evicted for the checkpoint
+static int64_t slot_clock = 0;        //strictly increasing LRU clock (seconds tie within a request)
+static std::vector<uint8_t> loom_slot_fork; //per slot: 1 if it holds a fan-out checkpoint (shared trunk)
+
 extern bool kcpp_permit_any_repack;
 extern bool kcpp_pipeline_parallelism;
 extern bool OldBPETokenizerMode;
@@ -3630,6 +3642,16 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             kcpp_data->smartcache = false;
             printf("\nSmartCache IS DISABLED!\nSmartCache requires Fast Forwarding!\n");
         }
+        loomcache_enabled = (inputs.loomcache && kcpp_data->smartcache && savestate_limit>0);
+        loom_slot_fork.assign(savestate_limit,0);
+        if(loomcache_enabled)
+        {
+            printf("LoomCache: prefix-tree branch cache over %d SmartCache slots\n",savestate_limit);
+        }
+        else if(inputs.loomcache)
+        {
+            printf("\nLoomCache IS DISABLED! It requires SmartCache with Fast Forwarding.\n");
+        }
 
         if(llama_model_rope_type(llamamodel)==LLAMA_ROPE_TYPE_MROPE || llama_model_rope_type(llamamodel)==LLAMA_ROPE_TYPE_IMROPE)
         {
@@ -5645,6 +5667,112 @@ int smartcache_quick_snapshot(int specific_slot = -1)
     }
 }
 
+//LOOM tree cache: keep the leaf we are about to abandon as a branch, unless it is already stored
+//or too small to matter. Returns the slot it lives in, or -1 if it was not kept.
+static int loomcache_keep_leaf(int shared_with_request, int exclude_slot)
+{
+    const int leaf_len = (int)current_context_tokens.size() - shared_with_request;
+    if((int)current_context_tokens.size() <= 32 || leaf_len < loom_block)
+    {
+        return -1;
+    }
+    int identical_slot = get_identical_existing_slot();
+    if(identical_slot!=-1)
+    {
+        touch_slot(identical_slot);
+        return identical_slot;
+    }
+    int slot = get_oldest_slot(exclude_slot);
+    printf("\n[LoomCache: keeping %zu-token branch (diverges at %d) in slot %d]\n",current_context_tokens.size(),shared_with_request,slot);
+    gpttype_save_state_kv(slot);
+    return slot;
+}
+
+//LOOM tree cache: choose the branch to resume from before fast-forward runs.
+//Non-recurrent KV can rewind, so any branch sharing a prefix is usable and fast-forward trims it.
+//Recurrent state cannot rewind, so a branch is usable only if the request fully contains it, and
+//the point where the request leaves a known branch is recorded for a mid-prefill checkpoint.
+static void loomcache_resolve(std::vector<int> & embd_inp, bool is_recurrent)
+{
+    loom_fork_target = -1;
+    loom_fork_exclude = -1;
+
+    auto usable_len = [&](std::vector<int> & branch) -> int {
+        if(is_recurrent)
+        {
+            return FullyContainedPrefix(branch,embd_inp) ? (int)branch.size() : 0;
+        }
+        return ComputeSharedPrefixLength(branch,embd_inp);
+    };
+
+    const int cur_shared = ComputeSharedPrefixLength(current_context_tokens,embd_inp);
+    const int cur_usable = usable_len(current_context_tokens);
+    int best_slot = -1;
+    int best_usable = cur_usable;
+    int fork_point = 0; //deepest point at which the request leaves any known branch
+    if(cur_shared < (int)current_context_tokens.size())
+    {
+        fork_point = cur_shared;
+    }
+    for(int i=0;i<savestate_limit;++i)
+    {
+        auto & slot_tokens = savestates[i].savestate_context_tokens;
+        if(slot_tokens.empty() || savestates[i].media_signature!=media_composite_image_signature)
+        {
+            continue;
+        }
+        const int shared = ComputeSharedPrefixLength(slot_tokens,embd_inp);
+        if(shared < (int)slot_tokens.size() && shared > fork_point)
+        {
+            fork_point = shared;
+        }
+        const int usable = usable_len(slot_tokens);
+        if(usable >= best_usable + loom_block)
+        {
+            best_usable = usable;
+            best_slot = i;
+        }
+    }
+
+    if(best_slot!=-1)
+    {
+        loom_fork_exclude = loomcache_keep_leaf(cur_shared,best_slot);
+        printf("\n[LoomCache: resuming branch in slot %d (%d of %zu prompt tokens reusable)]\n",best_slot,best_usable,embd_inp.size());
+        gpttype_load_state_kv(best_slot);
+    }
+    else
+    {
+        loom_fork_exclude = loomcache_keep_leaf(cur_shared,-1);
+    }
+
+    if(is_recurrent && fork_point >= loom_min_fork && fork_point >= best_usable + loom_block && fork_point < (int)embd_inp.size())
+    {
+        loom_fork_target = fork_point;
+    }
+}
+
+//recurrent only: called after each prefill decode; stores the fan-out point as its own branch
+static void loomcache_checkpoint_fork()
+{
+    if(loom_fork_target<=0 || (int)current_context_tokens.size()!=loom_fork_target)
+    {
+        return;
+    }
+    loom_fork_target = -1;
+    int identical_slot = get_identical_existing_slot();
+    if(identical_slot!=-1)
+    {
+        touch_slot(identical_slot);
+        return;
+    }
+    int slot = get_oldest_slot(loom_fork_exclude);
+    printf("\n[LoomCache: checkpointing %zu-token fan-out point in slot %d]\n",current_context_tokens.size(),slot);
+    if(gpttype_save_state_kv(slot) > 0)
+    {
+        loom_slot_fork[slot] = 1;
+    }
+}
+
 generation_outputs gpttype_generate(const generation_inputs inputs)
 {
     BatchLegacyGuard batch_legacy_guard;
@@ -6223,7 +6351,12 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     bool blank_prompt = (addedmemory=="" && kcpp_data->prompt=="");
 
     //smart cache logic
-    if(kcpp_data->smartcache && file_format==FileFormat::GGUF_GENERIC)
+    loom_fork_target = -1; //never carry a checkpoint target over from an earlier (possibly aborted) request
+    if(loomcache_enabled && kcpp_data->smartcache && file_format==FileFormat::GGUF_GENERIC && !blank_prompt)
+    {
+        loomcache_resolve(embd_inp, is_recurrent);
+    }
+    else if(kcpp_data->smartcache && file_format==FileFormat::GGUF_GENERIC)
     {
         bool shiftable = true;
         if(!kcpp_data->use_contextshift || is_recurrent)
@@ -6829,6 +6962,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         }
 
         n_past += embd.size();
+        if(loomcache_enabled && is_recurrent && !startedsampling)
+        {
+            loomcache_checkpoint_fork();
+        }
         if(rnn_lifeboat_enabled && !rnn_lifeboat_taken && !startedsampling && n_past >= rnn_lifeboat_target && input_consumed < (int)embd_inp.size())
         {
             int lifeboat_slot = rnn_lifeboat_hard_reserved ? smartcache_quick_snapshot(rnn_lifeboat_slot_idx) : smartcache_quick_snapshot();
@@ -7433,6 +7570,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     {
                         break;
                     }
+                    if (loom_fork_target > 0 && (int)current_context_tokens.size() == loom_fork_target)
+                    {
+                        break; //end this batch exactly at the fan-out point so it can be checkpointed
+                    }
                 }
 
             }
@@ -7544,6 +7685,10 @@ size_t gpttype_save_state_kv(int slot)
     if(file_format == FileFormat::GGUF_GENERIC)
     {
         size_t totalbytes = 0;
+        if(slot < (int)loom_slot_fork.size())
+        {
+            loom_slot_fork[slot] = 0; //any overwrite demotes the slot; the fork checkpoint path re-marks it
+        }
         if (!savestates[slot].current_savestate_buffer.empty()) {  //JIT free
             savestates[slot].current_savestate_buffer.clear();
             savestates[slot].current_draft_savestate_buffer.clear();
@@ -7674,6 +7819,10 @@ bool gpttype_clear_state_kv(bool shrink)
                     savestates[slot].current_draft_savestate_size = 0;
                 }
                 savestates[slot].last_used = 0;
+                if(slot < (int)loom_slot_fork.size())
+                {
+                    loom_slot_fork[slot] = 0;
+                }
             }
         }
         return true;
@@ -7683,8 +7832,9 @@ bool gpttype_clear_state_kv(bool shrink)
 void touch_slot(int slot) //update the slot's last used time and nothing else
 {
     auto timenow = std::chrono::system_clock::now();
-    auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(timenow.time_since_epoch()).count();
-    savestates[slot].last_used = timestamp;
+    int64_t timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(timenow.time_since_epoch()).count();
+    slot_clock = std::max(timestamp, slot_clock + 1); //strictly increasing so same-request saves order correctly
+    savestates[slot].last_used = slot_clock;
 }
 int get_identical_existing_slot() //returns slot number of slot containing exactly the same data, or -1 if nothing
 {
@@ -7718,6 +7868,40 @@ int get_identical_existing_slot() //returns slot number of slot containing exact
 
 int get_oldest_slot(int excludeSlotId)
 {
+    if(loomcache_enabled)
+    {
+        //prefer evicting leaves: fork checkpoints are shared trunk that every later sibling resumes from.
+        //forks are evicted (oldest first) only once they hold more than half of the slots.
+        int forks = 0;
+        for(int i=0;i<savestate_limit && i<(int)loom_slot_fork.size();++i)
+        {
+            forks += (loom_slot_fork[i] ? 1 : 0);
+        }
+        const bool protect_forks = (forks*2 <= savestate_limit);
+        int64_t best_age = INT64_MAX;
+        int best = -1;
+        for(int i=0;i<savestate_limit;++i)
+        {
+            if(i==excludeSlotId || i==rnn_reusable_slot_idx || (rnn_lifeboat_hard_reserved && i==rnn_lifeboat_slot_idx))
+            {
+                continue;
+            }
+            if(protect_forks && i<(int)loom_slot_fork.size() && loom_slot_fork[i])
+            {
+                continue;
+            }
+            if(savestates[i].last_used <= best_age)
+            {
+                best_age = savestates[i].last_used;
+                best = i;
+            }
+        }
+        if(best!=-1)
+        {
+            return best;
+        }
+        //every candidate was protected or reserved: fall through to plain LRU
+    }
     int64_t slotage = INT64_MAX; // Initialize with maximum possible value
     int slotid = 0;
     for(int i=0;i<savestate_limit;++i)

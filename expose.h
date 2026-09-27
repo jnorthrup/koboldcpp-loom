@@ -92,6 +92,7 @@ struct load_model_inputs
     const int continuous_batching_slots = 0;
     const int rpc_mode = 0; //0=disabled, 1=connect, 2=host
     const char * rpc_targets = nullptr;
+    const bool loomcache = false; //LOOM tree cache: smartcache slots act as prefix-tree branches
 };
 struct generation_inputs
 {
