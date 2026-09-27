@@ -24,16 +24,12 @@ koboldcpp-loom: loom features
   at shutdown are marked interrupted on restart. Frame rendering is loom-frames/1,
   byte-identical to the plugin's loomframes.py; change both together.
 
-TODO: persistent state (the continuum from "a user's KV cache" to "a GPU's token dump")
+Persistent state: the continuum from "a user's KV cache" to "a GPU's token dump"
   1 recipe            loom script                    done (/v1/looms)
   2 run artifact      requests + responses           done (loom-run/1, replay)
   3 warm process      KV slots in RAM                done (--loomcache; lost on idle-out)
-  4 state file        a loom trunk's KV/state on disk, reloaded instead of re-prefilled
-                      Mechanism: llama_state_get_data/set_data (already used by
-                      SmartCache) written to DIR with a header of model digest, KV
-                      type, context size, token list; refuse to load on any mismatch.
-                      Pays only when moving the bytes beats recomputing the tokens;
-                      unmeasured. Per-account like the scripts.
-  5 shared dump       level 4 files reused across accounts: same mechanism, but only for
-                      public content (tenant isolation).
+  4 state file        NOT DOING (operator decision, 2026-09-27): a KV/state snapshot is
+  5 shared dump       gigabytes per loom (a 27B model at 16k context is GB-scale), so
+                      looms persist as text only. After a cold start, a --prewarm run
+                      (max_tokens=1 per leaf) rebuilds the RAM cache from the recipe.
   Hosting/billing proposal: runpod experiments/loom/docs/looms-hosting-proposal.md.
