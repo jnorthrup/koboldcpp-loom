@@ -1,21 +1,18 @@
-"""loom: a Hermes context engine that keeps a /goal plan at the front of every request.
+"""loom: a Hermes context engine that keeps a /goal nesting stack at the front of every request.
 
-The plan is a tree of prompt segments. Each segment is an independent obstack frame: it is
-pushed once, its text never changes, and it only refers to its parent. Nothing interlocks, so
-switching work between sibling branches is a pop back to the shared ancestor plus a push of the
-new branch.
+The model works like nested for loops. Entering a loop pushes a frame (its stable instructions);
+leaving it pops the frame. The frames on the stack, outermost first, are rendered onto the end
+of the system prompt after the /goal text. Each frame is an independent obstack frame: it holds
+only its own text, nothing refers across frames, and a pop simply discards the top.
 
-On every model request the goal and every segment, in the order they were pushed, are rendered
-onto the end of the system prompt. Pushing only appends to that text, so what is already there
-never moves. The focus pointer, the fastest-moving fact, rides on the newest message, which the
-server recomputes anyway. The shape is a whip: a long base that does not move and a short tip
-that moves every turn. A prefix cache on the server (koboldcpp --loomcache, or any provider
-prompt cache) therefore keeps the front and recomputes only the tail. Planning the tree up front
-matters: a push made late re-sends the conversation that sits after the trunk.
+That ordering is the nested-loop shape: outer frames change least often and sit furthest
+forward, the innermost frame changes most often and sits last, and the conversation (the loop
+body) follows. The next sibling iteration is a pop plus a push, so only the tail after the
+common frames moves. A prefix cache on the server (koboldcpp --loomcache, or any provider
+prompt cache) keeps everything before the change; nothing about frames or boundaries is sent.
 
-There are no cache hints, tiers or segment counts anywhere: the server finds the reusable
-prefix from the tokens alone. Compaction is inherited unchanged from the built-in compressor;
-it only rewrites conversation turns, never the trunk.
+Compaction is inherited unchanged from the built-in compressor; it only rewrites conversation
+turns, never the frames.
 
 Enable with ``context.engine: loom`` in config.yaml.
 """
@@ -34,11 +31,11 @@ from agent.context_engine import ContextEngine  # noqa: F401  (discovery scans t
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "loom"
-_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _MAX_TEXT = 4000
-_MAX_NODES = 256
-TRUNK_OPEN = "[loom trunk: the planned work tree, in the order it was laid down; the current focus is noted on the newest message]"
-TRUNK_CLOSE = "[/loom trunk]"
+_MAX_DEPTH = 64
+FRAMES_OPEN = "[loom: nested work frames, outermost first; the last frame is the current loop]"
+FRAMES_CLOSE = "[/loom]"
 
 _ACTIVE: Optional["LoomEngine"] = None  # engine of the most recently started session, for /loom
 
@@ -47,123 +44,74 @@ def _clean_text(text: Any) -> str:
     return str(text or "").replace("\r\n", "\n").strip()
 
 
-class LoomTree:
-    """Append-only tree of prompt segments with a focus pointer (the obstack top)."""
+class LoomStack:
+    """Obstack of prompt frames: push appends, pop discards the top. Nothing else."""
 
     def __init__(self) -> None:
-        self.nodes: Dict[str, Dict[str, Any]] = {}  # id -> {"text", "parent"}; insertion ordered
-        self.focus: Optional[str] = None
+        self.frames: List[Dict[str, str]] = []  # [{"label", "text"}], outermost first
 
-    # -- persistence -------------------------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
-        return {"nodes": [{"id": k, **v} for k, v in self.nodes.items()], "focus": self.focus}
+        return {"frames": list(self.frames)}
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "LoomTree":
-        tree = cls()
-        for node in data.get("nodes") or []:
-            nid = str(node.get("id") or "")
-            parent = node.get("parent")
-            if _ID_RE.match(nid) and (parent is None or parent in tree.nodes):
-                tree.nodes[nid] = {"text": _clean_text(node.get("text")), "parent": parent}
-        focus = data.get("focus")
-        tree.focus = focus if focus in tree.nodes else None
-        return tree
+    def from_dict(cls, data: Dict[str, Any]) -> "LoomStack":
+        stack = cls()
+        for frame in (data.get("frames") or [])[:_MAX_DEPTH]:
+            text = _clean_text(frame.get("text")) if isinstance(frame, dict) else ""
+            label = str(frame.get("label") or "") if isinstance(frame, dict) else ""
+            if text:
+                stack.frames.append({"label": label if _LABEL_RE.match(label) else "", "text": text})
+        return stack
 
-    # -- structure ---------------------------------------------------------------------------
-    def path(self, nid: Optional[str]) -> List[str]:
-        out: List[str] = []
-        while nid is not None:
-            out.append(nid)
-            nid = self.nodes[nid]["parent"]
-        return list(reversed(out))
-
-    def children(self, nid: Optional[str]) -> List[str]:
-        return [k for k, v in self.nodes.items() if v["parent"] == nid]
-
-    def add(self, nid: str, text: str, parent: Optional[str]) -> str:
-        """Push a segment. Re-adding an identical segment is a no-op; changing one is refused."""
+    def push(self, text: Any, label: Any = "") -> None:
         text = _clean_text(text)
-        if not _ID_RE.match(nid or ""):
-            raise ValueError(f"bad id {nid!r}: use 1-64 chars of letters, digits, '_', '.', '-'")
-        if parent is not None and parent not in self.nodes:
-            raise ValueError(f"unknown parent {parent!r}")
+        label = str(label or "").strip()
         if not text:
-            raise ValueError(f"segment {nid!r} has no text")
+            raise ValueError("push needs text")
         if len(text) > _MAX_TEXT:
-            raise ValueError(f"segment {nid!r} is {len(text)} chars; limit {_MAX_TEXT}. Split it into children.")
-        existing = self.nodes.get(nid)
-        if existing is not None:
-            if existing["text"] == text and existing["parent"] == parent:
-                return "unchanged"
-            raise ValueError(
-                f"segment {nid!r} already exists and segments are immutable; push a new id instead "
-                "(editing a segment would move every cached token after it)")
-        if len(self.nodes) >= _MAX_NODES:
-            raise ValueError(f"tree is full ({_MAX_NODES} segments)")
-        self.nodes[nid] = {"text": text, "parent": parent}
-        return "added"
+            raise ValueError(f"frame is {len(text)} chars; limit {_MAX_TEXT}. Push a nested frame instead.")
+        if label and not _LABEL_RE.match(label):
+            raise ValueError(f"bad label {label!r}: use 1-64 chars of letters, digits, '_', '.', '-'")
+        if len(self.frames) >= _MAX_DEPTH:
+            raise ValueError(f"nesting is {_MAX_DEPTH} deep; pop before pushing")
+        self.frames.append({"label": label, "text": text})
 
-    def plan(self, specs: List[Dict[str, Any]], parent: Optional[str]) -> List[str]:
-        """Add a nested list of ``{id, text, children}`` under ``parent``; all-or-nothing."""
-        staged = LoomTree.from_dict(self.to_dict())
-        added: List[str] = []
+    def pop(self, count: int = 1) -> int:
+        if count < 1:
+            raise ValueError("pop count must be at least 1")
+        if count > len(self.frames):
+            raise ValueError(f"only {len(self.frames)} frame(s) to pop")
+        del self.frames[len(self.frames) - count:]
+        return count
 
-        def walk(items: Any, under: Optional[str]) -> None:
-            if not isinstance(items, list):
-                raise ValueError("'nodes' must be a list of {id, text, children}")
-            for item in items:
-                if not isinstance(item, dict):
-                    raise ValueError("each node must be an object with id and text")
-                nid = str(item.get("id") or "")
-                if staged.add(nid, item.get("text"), under) == "added":
-                    added.append(nid)
-                walk(item.get("children") or [], nid)
+    def _name(self, depth: int) -> str:
+        label = self.frames[depth]["label"]
+        return f"{depth + 1}" + (f" {label}" if label else "")
 
-        walk(specs, parent)
-        self.nodes, self.focus = staged.nodes, staged.focus
-        return added
-
-    # -- rendering ---------------------------------------------------------------------------
-    def render_trunk(self, goal_block: str) -> str:
-        """Every segment in push order. Pushing only appends here and focus is not rendered, so
-        earlier text never moves: the trunk grows at its end and nowhere else."""
-        parts = [TRUNK_OPEN]
+    def render(self, goal_block: str) -> str:
+        parts = [FRAMES_OPEN]
         if goal_block:
             parts.append("== goal ==\n" + goal_block)
-        for nid, node in self.nodes.items():
-            under = f" (under {node['parent']})" if node["parent"] else ""
-            parts.append(f"== {nid}{under} ==\n{node['text']}")
-        parts.append(TRUNK_CLOSE)
+        for depth, frame in enumerate(self.frames):
+            parts.append(f"== {self._name(depth)} ==\n{frame['text']}")
+        parts.append(FRAMES_CLOSE)
         return "\n".join(parts)
 
-    def render_focus(self) -> str:
-        if self.focus is None:
-            return "[loom focus: root]"
-        return "[loom focus: " + " > ".join(self.path(self.focus)) + "]"
-
-    def render_outline(self) -> str:
-        if not self.nodes:
-            return "(empty)"
-        on_path = set(self.path(self.focus))
-        lines: List[str] = []
-
-        def walk(under: Optional[str], depth: int) -> None:
-            for nid in self.children(under):
-                mark = "*" if nid == self.focus else ("|" if nid in on_path else " ")
-                first = self.nodes[nid]["text"].split("\n", 1)[0]
-                if len(first) > 70:
-                    first = first[:67] + "..."
-                lines.append(f"{mark} {'  ' * depth}{nid}: {first}")
-                walk(nid, depth + 1)
-
-        walk(None, 0)
+    def outline(self) -> str:
+        if not self.frames:
+            return "(no frames)"
+        lines = []
+        for depth, frame in enumerate(self.frames):
+            first = frame["text"].split("\n", 1)[0]
+            if len(first) > 70:
+                first = first[:67] + "..."
+            lines.append(f"{'  ' * depth}{self._name(depth)}: {first}")
         return "\n".join(lines)
 
 
 def _goal_block(session_id: str) -> str:
-    """Goal text plus subgoals, in their (append-only) stored order. Status is left out on purpose:
-    it changes every turn and would move the whole trunk."""
+    """Goal text plus subgoals. Status is left out on purpose: it changes every turn and would
+    move every frame behind it."""
     if not session_id:
         return ""
     try:
@@ -211,26 +159,19 @@ def _compression_kwargs() -> Dict[str, Any]:
 _TOOL_SCHEMA = {
     "name": TOOL_NAME,
     "description": (
-        "Plan work for the active /goal as a tree of prompt segments kept at the front of the context. "
-        "Segments are immutable once pushed and every segment is shown to you on every turn in push order; the "
-        "current focus path is noted on the newest message. Lay the whole tree down up front with 'plan' (pushes "
-        "made later re-send everything after the trunk), move between branches with 'focus' (free: it only "
-        "changes the newest message), 'push' a child of the focus or 'pop' to its parent, and keep volatile "
-        "findings in the conversation, not in segments. Actions: plan {nodes:[{id,text,children:[...]}], parent?}; "
-        "push {id,text}; pop; focus {id}; show."
+        "Nest work for the active /goal like nested loops. 'push' a frame when you enter a level of work "
+        "(its stable instructions, not findings); 'pop' when you leave it. Frames are shown to you at the "
+        "front of the context, outermost first, and the last frame is your current loop. Move to a sibling "
+        "with pop then push. Keep results and status in the conversation. "
+        "Actions: push {text, label?}; pop {count?}; show."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["plan", "push", "pop", "focus", "show"]},
-            "id": {"type": "string", "description": "Segment id (push, focus)."},
-            "text": {"type": "string", "description": "Segment text (push). Stable instructions only."},
-            "parent": {"type": "string", "description": "plan: attach under this segment (default: root)."},
-            "nodes": {
-                "type": "array",
-                "description": "plan: nested segments [{id, text, children: [...]}].",
-                "items": {"type": "object"},
-            },
+            "action": {"type": "string", "enum": ["push", "pop", "show"]},
+            "text": {"type": "string", "description": "push: the frame's stable instructions."},
+            "label": {"type": "string", "description": "push: optional short name for the frame."},
+            "count": {"type": "integer", "description": "pop: frames to pop (default 1)."},
         },
         "required": ["action"],
     },
@@ -238,14 +179,14 @@ _TOOL_SCHEMA = {
 
 
 class LoomEngine(ContextCompressor):
-    """ContextCompressor plus a front-of-context /goal plan tree."""
+    """ContextCompressor plus a front-of-context /goal frame stack."""
 
     def __init__(self, model: str = "", **kwargs: Any) -> None:
         settings = _compression_kwargs()
         settings.update(kwargs)
         settings.setdefault("quiet_mode", True)
         super().__init__(model=model, **settings)
-        self.tree = LoomTree()
+        self.stack = LoomStack()
         self._loom_session = ""
         self._loom_home = ""
 
@@ -267,7 +208,7 @@ class LoomEngine(ContextCompressor):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.tree.to_dict(), f, ensure_ascii=True, indent=1)
+            json.dump(self.stack.to_dict(), f, ensure_ascii=True, indent=1)
         os.replace(tmp, path)
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
@@ -285,37 +226,30 @@ class LoomEngine(ContextCompressor):
                 home = ""
         self._loom_home = home or ""
         path = self._state_path()
-        # A saved tree for this session wins; otherwise keep what we hold (a delegated child
-        # starts from its parent's tree, so it shares the parent's front of context).
+        # A saved stack for this session wins; otherwise keep what we hold (a delegated child
+        # starts inside its parent's frames, like an inner loop).
         if path and os.path.exists(path):
             try:
                 with open(path, encoding="utf-8") as f:
-                    self.tree = LoomTree.from_dict(json.load(f))
+                    self.stack = LoomStack.from_dict(json.load(f))
             except Exception as exc:
                 logger.warning("loom: could not read %s: %s", path, exc)
         _ACTIVE = self
 
     def on_session_reset(self) -> None:
         super().on_session_reset()
-        self.tree = LoomTree()
+        self.stack = LoomStack()
 
     # -- per-request selection ---------------------------------------------------------------
     def select_context(self, request_messages: List[Dict[str, Any]], **kwargs: Any) -> Optional[List[Dict[str, Any]]]:
         goal = _goal_block(self._loom_session)
-        if not goal and not self.tree.nodes:
-            return None  # nothing planned: leave the request byte-identical
+        if not goal and not self.stack.frames:
+            return None  # nothing nested: leave the request byte-identical
         if not request_messages or request_messages[0].get("role") != "system":
             return None
         first = dict(request_messages[0])
-        first["content"] = _append_to_content(first.get("content"), self.tree.render_trunk(goal))
-        out = [first] + list(request_messages[1:])
-        # The focus pointer is the fastest-moving fact, so it rides on the newest row, which the
-        # server recomputes anyway. Request-only: persisted history is untouched.
-        if self.tree.nodes and len(out) > 1 and out[-1].get("role") in ("user", "tool"):
-            last = dict(out[-1])
-            last["content"] = _append_to_content(last.get("content"), self.tree.render_focus())
-            out[-1] = last
-        return out
+        first["content"] = _append_to_content(first.get("content"), self.stack.render(goal))
+        return [first] + list(request_messages[1:])
 
     # -- tool --------------------------------------------------------------------------------
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -324,44 +258,20 @@ class LoomEngine(ContextCompressor):
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs: Any) -> str:
         if name != TOOL_NAME:
             return super().handle_tool_call(name, args, **kwargs)
-        try:
-            result = self._dispatch(args or {})
-        except ValueError as exc:
-            return json.dumps({"error": str(exc), "outline": self.tree.render_outline()})
-        self._save()
-        result.setdefault("focus", self.tree.focus)
-        result.setdefault("outline", self.tree.render_outline())
-        return json.dumps(result)
-
-    def _dispatch(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        args = args or {}
         action = str(args.get("action") or "").strip().lower()
-        tree = self.tree
-        if action == "plan":
-            parent = args.get("parent") or None
-            added = tree.plan(args.get("nodes") or [], parent)
-            if tree.focus is None and added:
-                first_child = tree.children(parent)
-                tree.focus = first_child[0] if first_child else added[0]
-            return {"ok": True, "added": added}
-        if action == "push":
-            nid = str(args.get("id") or "")
-            status = tree.add(nid, args.get("text"), tree.focus)
-            tree.focus = nid
-            return {"ok": True, "push": status}
-        if action == "pop":
-            if tree.focus is None:
-                raise ValueError("already at the root")
-            tree.focus = tree.nodes[tree.focus]["parent"]
-            return {"ok": True}
-        if action == "focus":
-            nid = args.get("id") or None
-            if nid is not None and nid not in tree.nodes:
-                raise ValueError(f"unknown segment {nid!r}")
-            tree.focus = nid
-            return {"ok": True}
-        if action == "show":
-            return {"ok": True, "trunk": tree.render_trunk(_goal_block(self._loom_session))}
-        raise ValueError(f"unknown action {action!r}; use plan, push, pop, focus or show")
+        try:
+            if action == "push":
+                self.stack.push(args.get("text"), args.get("label"))
+            elif action == "pop":
+                self.stack.pop(int(args.get("count") or 1))
+            elif action != "show":
+                raise ValueError(f"unknown action {action!r}; use push, pop or show")
+        except (ValueError, TypeError) as exc:
+            return json.dumps({"error": str(exc), "depth": len(self.stack.frames), "frames": self.stack.outline()})
+        if action != "show":
+            self._save()
+        return json.dumps({"ok": True, "depth": len(self.stack.frames), "frames": self.stack.outline()})
 
 
 def _loom_command(raw_args: str = "") -> str:
@@ -370,7 +280,7 @@ def _loom_command(raw_args: str = "") -> str:
         return "loom: no active session (set context.engine: loom in config.yaml)"
     goal = _goal_block(engine._loom_session)
     head = "goal: " + (goal.split("\n", 1)[0] if goal else "(none)")
-    return head + "\n" + engine.tree.render_outline() + "\n(* = focus, | = on the trunk path)"
+    return head + "\n" + engine.stack.outline()
 
 
 def register(ctx: Any) -> None:
@@ -384,4 +294,4 @@ def register(ctx: Any) -> None:
             return
     except Exception:
         pass
-    register_command("loom", _loom_command, description="Show the /goal plan tree kept at the front of context")
+    register_command("loom", _loom_command, description="Show the /goal frame stack kept at the front of context")
