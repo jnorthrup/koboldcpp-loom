@@ -1,0 +1,4 @@
+The Hermes loom plugin now lives in its own repository:
+  https://github.com/jnorthrup/loom-hermes-plugin
+It was developed here (commits 1eaa89cc2, 9c66f41e6) and moved with its history;
+see PROVENANCE.txt there.

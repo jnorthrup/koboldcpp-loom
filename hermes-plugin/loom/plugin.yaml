@@ -1,3 +1,0 @@
-name: loom
-version: 0.1.0
-description: "Nests /goal work as a push/pop stack of prompt frames at the front of every request (nested-loop shape), so prefix caches (koboldcpp --loomcache, provider prompt caches) reuse the enclosing frames; compaction as the built-in compressor"
