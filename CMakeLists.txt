@@ -44,6 +44,7 @@ option(LLAMA_HIPBLAS                         "llama: use hipBLAS"               
 
 # Other
 option(LLAMA_OPENMP                          "llama: use OpenMP"                                OFF)
+option(KCPP_PARROT                           "koboldcpp: Parrot TTS backend (Kokoro ONNX via tts-rs, needs cargo)" OFF)
 
 #
 # Compile flags
@@ -578,6 +579,36 @@ target_include_directories(tts_adapter PUBLIC . ./ggml/include ./ggml/src ./ggml
 target_compile_features(tts_adapter PUBLIC cxx_std_17) # don't bump
 target_link_libraries(tts_adapter PRIVATE common2 ggml ${LLAMA_EXTRA_LIBS})
 set_target_properties(tts_adapter PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if (KCPP_PARROT)
+    find_program(CARGO_EXECUTABLE cargo REQUIRED)
+    set(PARROT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/otherarch/parrot)
+    if (WIN32)
+        set(PARROT_LIB ${PARROT_DIR}/target/release/kcpp_parrot.lib)
+    else()
+        set(PARROT_LIB ${PARROT_DIR}/target/release/libkcpp_parrot.a)
+    endif()
+    add_custom_command(
+        OUTPUT ${PARROT_LIB}
+        COMMAND ${CARGO_EXECUTABLE} build --release
+        WORKING_DIRECTORY ${PARROT_DIR}
+        DEPENDS ${PARROT_DIR}/Cargo.toml ${PARROT_DIR}/src/lib.rs
+        COMMENT "Building Parrot TTS (tts-rs) static library"
+        VERBATIM)
+    add_custom_target(kcpp_parrot_build DEPENDS ${PARROT_LIB})
+    add_library(kcpp_parrot STATIC IMPORTED GLOBAL)
+    set_target_properties(kcpp_parrot PROPERTIES IMPORTED_LOCATION ${PARROT_LIB})
+    add_dependencies(kcpp_parrot kcpp_parrot_build)
+    if (APPLE)
+        target_link_libraries(kcpp_parrot INTERFACE "-framework Foundation" "-framework CoreFoundation" "-framework Security" c++)
+    elseif (WIN32)
+        target_link_libraries(kcpp_parrot INTERFACE bcrypt ntdll userenv ws2_32 advapi32 ole32 oleaut32)
+    else()
+        target_link_libraries(kcpp_parrot INTERFACE pthread dl m rt)
+    endif()
+    target_compile_definitions(tts_adapter PUBLIC KCPP_PARROT)
+    target_link_libraries(tts_adapter PUBLIC kcpp_parrot)
+endif()
 
 add_library(embeddings_adapter
             otherarch/embeddings_adapter.cpp)

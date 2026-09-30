@@ -1067,6 +1067,9 @@ def init_library():
     handle.tts_load_model.restype = ctypes.c_bool
     handle.tts_generate.argtypes = [tts_generation_inputs]
     handle.tts_generate.restype = tts_generation_outputs
+    if hasattr(handle, "tts_list_voices"):
+        handle.tts_list_voices.argtypes = []
+        handle.tts_list_voices.restype = ctypes.c_char_p
     handle.embeddings_load_model.argtypes = [embeddings_load_model_inputs]
     handle.embeddings_load_model.restype = ctypes.c_bool
     handle.embeddings_generate.argtypes = [embeddings_generation_inputs]
@@ -9836,7 +9839,7 @@ def show_gui():
     audio_tab = tabcontent["Audio"]
     makefileentry(audio_tab, "Whisper Model (Speech-To-Text):", "Select Whisper .bin Model File", whisper_model_var, 1, width=280, filetypes=[("*.bin","*.bin")], tooltiptxt="Select a Whisper .bin model file on disk to be loaded for Voice Recognition.")
     whisper_model_var.trace_add("write", gui_changed_modelfile)
-    makefileentry(audio_tab, "TTS Model (Text-To-Speech):", "Select TTS GGUF Model File", tts_model_var, 3, width=280, filetypes=[("*.gguf","*.gguf")], tooltiptxt="Select a TTS GGUF model file on disk to be loaded for Narration.")
+    makefileentry(audio_tab, "TTS Model (Text-To-Speech):", "Select TTS GGUF Model File", tts_model_var, 3, width=280, filetypes=[("*.gguf","*.gguf"),("Parrot Kokoro *.onnx","*.onnx")], tooltiptxt="Select a TTS GGUF model file on disk to be loaded for Narration.")
     tts_model_var.trace_add("write", gui_changed_modelfile)
     makelabelentry(audio_tab, "TTS Threads:" , tts_threads_var, 5, 50,padx=100,singleline=True,tooltip="How many threads to use during TTS generation.\nIf left blank, uses same value as threads.")
     makelabelentry(audio_tab, "TTS Max Tokens:" , ttsmaxlen_var, 5, 50,padx=300,singleline=True,tooltip="Max allowed audiotokens to generate per TTS request.", labelpadx=190)
@@ -12690,19 +12693,39 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
             voicecount = 0
             voicelist = []
 
+            # backends with a native voice set (e.g. Parrot/Kokoro ONNX) publish it here, so
+            # Lite's KoboldCpp TTS dropdown (/speakers_list) shows voices the model actually has
+            native_voices = []
             try:
-                with open(os.path.join(embddir, "qwen3tts_voices_json.embd"), mode='r', encoding='utf-8', errors='ignore') as f:
-                    vdict = json.load(f)
-                    for key, value in vdict.items():
-                        voicelist.append(key)
-                        voicebank[key] = value
+                if ttsmodelpath and hasattr(handle, "tts_list_voices"):
+                    raw = handle.tts_list_voices()
+                    if raw:
+                        native_voices = [v for v in raw.decode("UTF-8","ignore").split("\n") if v]
             except Exception:
-                print("Could not find Embedded Qwen3TTS voices.")
+                native_voices = []
+            if native_voices:
+                # put the 5 legacy kokoro slot voices first so Lite's default selection is sensible
+                preferred = ["af_heart","am_echo","af_nicole","bm_fable","bf_isabella"]
+                ordered = [v for v in preferred if v in native_voices] + [v for v in native_voices if v not in preferred]
+                for v in ordered:
+                    voicelist.append(v)
+                    voicebank[v] = ""
+                print(f"TTS backend provides {len(ordered)} native voices.")
 
-            voicelist.append("random")
-            voicebank["random"] = ""
-            voicelist.append("instruct")
-            voicebank["instruct"] = ""
+            if not native_voices:
+                try:
+                    with open(os.path.join(embddir, "qwen3tts_voices_json.embd"), mode='r', encoding='utf-8', errors='ignore') as f:
+                        vdict = json.load(f)
+                        for key, value in vdict.items():
+                            voicelist.append(key)
+                            voicebank[key] = value
+                except Exception:
+                    print("Could not find Embedded Qwen3TTS voices.")
+
+                voicelist.append("random")
+                voicebank["random"] = ""
+                voicelist.append("instruct")
+                voicebank["instruct"] = ""
 
             if args.ttsdir and os.path.isdir(args.ttsdir):
                 for filename in os.listdir(args.ttsdir):
@@ -13111,7 +13134,7 @@ if __name__ == '__main__':
     whisperparsergroup.add_argument("--whispermodel", metavar=('[filename]'), help="Specify a Whisper .bin model to enable Speech-To-Text transcription.", default="")
 
     ttsparsergroup = parser.add_argument_group('TTS Narration Commands')
-    ttsparsergroup.add_argument("--ttsmodel", metavar=('[filename]'), help="Specify the TTS Text-To-Speech GGUF model.", default="")
+    ttsparsergroup.add_argument("--ttsmodel", metavar=('[filename]'), help="Specify the TTS Text-To-Speech GGUF model. If built with KCPP_PARROT, a Kokoro .onnx file or a directory with *.onnx + voices-v1.0.bin selects the Parrot backend (needs espeak-ng; override with KCPP_PARROT_ESPEAK / KCPP_PARROT_ESPEAK_DATA).", default="")
     ttsparsergroup.add_argument("--ttswavtokenizer", metavar=('[filename]'), help="Specify the WavTokenizer GGUF model.", default="")
     ttsparsergroup.add_argument("--ttsgpu", help="Use the GPU for TTS.", action='store_true')
     ttsparsergroup.add_argument("--ttsmaxlen", help="Limit number of audio tokens generated with TTS.",  type=int, default=default_ttsmaxlen)

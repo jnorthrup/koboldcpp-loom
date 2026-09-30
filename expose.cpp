@@ -248,6 +248,11 @@ extern "C"
     {
         return ttstype_generate(inputs);
     }
+    //newline-separated native voice ids of the loaded TTS backend, or "" if it has no enumerable voice set
+    const char * tts_list_voices()
+    {
+        return ttstype_list_voices();
+    }
 
     bool embeddings_load_model(const embeddings_load_model_inputs inputs)
     {

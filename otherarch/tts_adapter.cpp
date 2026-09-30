@@ -52,6 +52,12 @@
 #include "audio_tokenizer_encoder.cpp"
 #include "coreml_code_predictor_stub.cpp"
 
+#ifdef KCPP_PARROT
+//optional Parrot backend (Kokoro ONNX via tts-rs), enabled at configure time
+#include "parrot/kcpp_parrot.h"
+#include <sys/stat.h>
+#endif
+
 enum TTS_VER
 {
     TTS_VER_2,
@@ -515,6 +521,29 @@ extern bool qwen3tts_allowgpu;
 int total_tts_gens = 0;
 static std::string tts_executable_path = "";
 
+//parrot specific (only active when built with KCPP_PARROT)
+static bool is_parrot_file = false;
+#ifdef KCPP_PARROT
+//Parrot takes a Kokoro .onnx file or a directory holding *.onnx + voices-v1.0.bin
+static bool tts_path_is_parrot(const std::string & p)
+{
+    struct stat st;
+    if (stat(p.c_str(), &st) != 0) { return false; }
+    if (S_ISDIR(st.st_mode)) { return true; }
+    if (p.size() >= 5) {
+        std::string ext = p.substr(p.size() - 5);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        return ext == ".onnx";
+    }
+    return false;
+}
+static std::string parrot_env(const char * name)
+{
+    const char * v = getenv(name);
+    return v ? std::string(v) : std::string();
+}
+#endif
+
 bool ttstype_load_model(const tts_load_model_inputs inputs)
 {
     tts_is_quiet = inputs.quiet;
@@ -531,6 +560,32 @@ bool ttstype_load_model(const tts_load_model_inputs inputs)
 
     std::string modelfile_ttc = inputs.ttc_model_filename;
     std::string modelfile_cts = inputs.cts_model_filename;
+
+    is_parrot_file = false;
+#ifdef KCPP_PARROT
+    if (tts_path_is_parrot(modelfile_ttc))
+    {
+        is_parrot_file = true;
+        is_ttscpp_file = false;
+        is_qwen3tts_file = false;
+        detectedarch = "parrot-kokoro";
+        ttsdebugmode = inputs.debugmode;
+        tts_max_len = inputs.ttsmaxlen;
+        //espeak-ng is used for phonemization; override location via env if not on PATH
+        std::string esbin = parrot_env("KCPP_PARROT_ESPEAK");
+        std::string esdata = parrot_env("KCPP_PARROT_ESPEAK_DATA");
+        printf("\nLoading Parrot (Kokoro ONNX) TTS Model: %s\n", modelfile_ttc.c_str());
+        if (!parrot_load(modelfile_ttc.c_str(), inputs.threads, esbin.c_str(), esdata.c_str()))
+        {
+            printf("\nParrot TTS Load Error: %s\n", parrot_last_error());
+            is_parrot_file = false;
+            return false;
+        }
+        printf("\nTTS Load Complete.\n");
+        return true;
+    }
+#endif
+
     detectedarch = gguf_get_model_arch(modelfile_ttc);
 
     is_ttscpp_file = false;
@@ -1262,8 +1317,99 @@ static tts_generation_outputs ttstype_generate_qwen3tts(const tts_generation_inp
     }
 }
 
+#ifdef KCPP_PARROT
+static tts_generation_outputs ttstype_generate_parrot(const tts_generation_inputs inputs)
+{
+    tts_generation_outputs output;
+    output.data = "";
+    output.status = 0;
+    if (!parrot_is_loaded())
+    {
+        printf("\nWarning: KCPP Parrot not initialized! Make sure TTS model is loaded successfully.\n");
+        return output;
+    }
+
+    //same 1-5 speaker slots as the built-in kokoro path, but any voice in voices-v1.0.bin
+    //(all 54, incl. non-English) can be selected by name
+    const std::vector<std::string> vmapper = {"am_echo","af_heart","af_nicole","bm_fable","bf_isabella"};
+    int speaker_seed = inputs.speaker_seed;
+    std::string voiceused = "am_echo";
+    const std::string cspeaker = inputs.custom_speaker_voice;
+    if (cspeaker != "" && parrot_has_voice(cspeaker.c_str()))
+    {
+        voiceused = cspeaker;
+    }
+    else if (speaker_seed >= 1 && speaker_seed <= 5)
+    {
+        voiceused = vmapper[speaker_seed-1];
+    }
+
+    std::string prompt = inputs.prompt;
+    if (tts_max_len > 0)
+    {
+        prompt = TruncateToFirstNumberWords(prompt, tts_max_len);
+    }
+    if (prompt.find_first_not_of(" \t\r\n") == std::string::npos)
+    {
+        printf("\nWarning: Empty TTS prompt.\n");
+        return output;
+    }
+
+    if (ttsdebugmode==1 && !tts_is_quiet)
+    {
+        printf("\nUsing Speaker ID: %d, Voice: %s", speaker_seed, voiceused.c_str());
+        printf("\nInput: %s\n", prompt.c_str());
+    }
+    if (!tts_is_quiet)
+    {
+        printf("\nTTS Generating (Parrot)...");
+    }
+
+    timer_start();
+    float * samples = nullptr;
+    size_t nsamples = 0;
+    uint32_t rate = 0;
+    if (!parrot_synthesize(prompt.c_str(), voiceused.c_str(), 1.0f, &samples, &nsamples, &rate) || nsamples == 0)
+    {
+        printf("\nError: Parrot generation failed: %s\n", parrot_last_error());
+        parrot_free_samples(samples, nsamples);
+        return output;
+    }
+    std::vector<float> wavdat(samples, samples + nsamples);
+    parrot_free_samples(samples, nsamples);
+
+    double ttstime = timer_check();
+    printf("\nTTS Generated audio in %.2fs.\n", ttstime);
+    last_generated_audio = save_tts_audio_base64(wavdat, (int)rate, inputs.use_mp3);
+    output.data = last_generated_audio.c_str();
+    output.status = 1;
+    last_generation_settings_audio_seed = 0;
+    last_generation_settings_speaker_seed = speaker_seed;
+    last_generation_settings_prompt = prompt;
+    total_tts_gens += 1;
+    return output;
+}
+#endif
+
+const char * ttstype_list_voices()
+{
+#ifdef KCPP_PARROT
+    if (is_parrot_file && parrot_is_loaded())
+    {
+        return parrot_list_voices();
+    }
+#endif
+    return "";
+}
+
 tts_generation_outputs ttstype_generate(const tts_generation_inputs inputs)
 {
+#ifdef KCPP_PARROT
+    if (is_parrot_file)
+    {
+        return ttstype_generate_parrot(inputs);
+    }
+#endif
     if (is_ttscpp_file)
     {
         return ttstype_generate_ttscpp(inputs);

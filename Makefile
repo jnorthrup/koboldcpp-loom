@@ -88,6 +88,26 @@ llguidance.o: common/llguidance.cpp llguidance
 	$(CXX) $(CXXFLAGS) -Illguidance/target/release -c $< -o $@
 endif
 
+# Optional Parrot TTS backend (https://github.com/rishiskhare/parrot engine: Kokoro ONNX via tts-rs).
+# Configure with: make KCPP_PARROT=1   (needs cargo; espeak-ng at runtime)
+ifdef KCPP_PARROT
+PARROT_LIBDIR = otherarch/parrot/target/release
+PARROT_LIB = $(PARROT_LIBDIR)/libkcpp_parrot.a
+CFLAGS += -DKCPP_PARROT
+CXXFLAGS += -DKCPP_PARROT
+LDFLAGS += $(PARROT_LIB)
+ifeq ($(UNAME_S),Darwin)
+LDFLAGS += -framework Foundation -framework CoreFoundation -framework Security -lc++
+else ifeq ($(OS),Windows_NT)
+LDFLAGS += -lbcrypt -lntdll -luserenv -lws2_32 -ladvapi32 -lole32 -loleaut32
+else
+LDFLAGS += -lstdc++ -lpthread -ldl -lm -lrt
+endif
+TTS_PARROT_DEPS = $(PARROT_LIB)
+$(PARROT_LIB): otherarch/parrot/Cargo.toml otherarch/parrot/src/lib.rs
+	cd otherarch/parrot && cargo build --release
+endif
+
 FASTCFLAGS = $(subst -O3,-Ofast,$(CFLAGS))
 FASTCXXFLAGS = $(subst -O3,-Ofast,$(CXXFLAGS))
 
@@ -743,7 +763,7 @@ whispercpp_default.o: otherarch/whispercpp/whisper_adapter.cpp otherarch/whisper
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 #tts objects
-tts_default.o: otherarch/tts_adapter.cpp otherarch/ttscpp/src/ttscpp.cpp otherarch/ttscpp/src/ttstokenizer.cpp otherarch/ttscpp/src/ttssampler.cpp otherarch/ttscpp/src/parler_model.cpp otherarch/ttscpp/src/dac_model.cpp otherarch/ttscpp/src/ttsutil.cpp otherarch/ttscpp/src/ttsargs.cpp otherarch/ttscpp/src/ttst5_encoder_model.cpp otherarch/ttscpp/src/phonemizer.cpp otherarch/ttscpp/src/tts_model.cpp otherarch/ttscpp/src/kokoro_model.cpp otherarch/ttscpp/src/dia_model.cpp otherarch/ttscpp/src/orpheus_model.cpp otherarch/ttscpp/src/snac_model.cpp otherarch/ttscpp/src/general_neural_audio_codec.cpp
+tts_default.o: otherarch/tts_adapter.cpp otherarch/ttscpp/src/ttscpp.cpp otherarch/ttscpp/src/ttstokenizer.cpp otherarch/ttscpp/src/ttssampler.cpp otherarch/ttscpp/src/parler_model.cpp otherarch/ttscpp/src/dac_model.cpp otherarch/ttscpp/src/ttsutil.cpp otherarch/ttscpp/src/ttsargs.cpp otherarch/ttscpp/src/ttst5_encoder_model.cpp otherarch/ttscpp/src/phonemizer.cpp otherarch/ttscpp/src/tts_model.cpp otherarch/ttscpp/src/kokoro_model.cpp otherarch/ttscpp/src/dia_model.cpp otherarch/ttscpp/src/orpheus_model.cpp otherarch/ttscpp/src/snac_model.cpp otherarch/ttscpp/src/general_neural_audio_codec.cpp $(TTS_PARROT_DEPS)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 embeddings_default.o: otherarch/embeddings_adapter.cpp
@@ -773,6 +793,7 @@ clean:
 	rm -vrf ggml/src/ggml-cuda/*.o
 	rm -vrf ggml/src/ggml-cuda/template-instances/*.o
 	rm -vrf llguidance
+	rm -vrf otherarch/parrot/target
 	rm -vf otherarch/sdcpp/*.o otherarch/sdcpp/*/*.o otherarch/sdcpp/*/*/*.o otherarch/sdcpp/*/*/*/*.o
 
 # useful tools
