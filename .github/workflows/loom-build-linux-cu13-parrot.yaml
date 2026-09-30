@@ -36,7 +36,7 @@ jobs:
           apt-get update
           export DEBIAN_FRONTEND=noninteractive
           ln -fs /usr/share/zoneinfo/UTC /etc/localtime
-          apt-get -y install git curl bzip2 python3-tk tcl tk build-essential ca-certificates
+          apt-get -y install git curl bzip2 python3-tk tcl tk build-essential ca-certificates pkg-config libssl-dev
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.96.0
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
