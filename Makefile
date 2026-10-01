@@ -248,6 +248,10 @@ CUBLASLD_FLAGS += -Lconda/envs/linux/lib -Lconda/envs/linux/lib/stubs
 endif
 
 
+# LOOM: native SASS for the GPU classes we rent, so cold start skips PTX JIT.
+# LOOM_SASS="86 120" -> -gencode arch=compute_86,code=sm_86 ... (CU13 builds only).
+LOOM_SASS_FLAGS = $(foreach a,$(LOOM_SASS),-gencode arch=compute_$(a),code=sm_$(a))
+
 ifdef LLAMA_PORTABLE
 
 ifdef LLAMA_ARCHES_CU11
@@ -273,6 +277,7 @@ NVCCFLAGS += -Wno-deprecated-gpu-targets \
              -gencode arch=compute_86,code=compute_86 \
              -gencode arch=compute_89,code=compute_89 \
              -gencode arch=compute_120,code=compute_120 \
+			 $(LOOM_SASS_FLAGS) \
 			 -DKCPP_LIMIT_CUDA_MAX_ARCH=1200
 
 else

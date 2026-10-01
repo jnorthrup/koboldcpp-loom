@@ -18,6 +18,7 @@ env:
   KCPP_PARROT: 1
   KCPP_APPEND: -parrot
   KCPP_JOBS: 12
+  LOOM_SASS: 86 120
 
 jobs:
   linux:
