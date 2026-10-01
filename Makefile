@@ -251,6 +251,10 @@ endif
 # LOOM: native SASS for the GPU classes we rent, so cold start skips PTX JIT.
 # LOOM_SASS="86 120" -> -gencode arch=compute_86,code=sm_86 ... (CU13 builds only).
 LOOM_SASS_FLAGS = $(foreach a,$(LOOM_SASS),-gencode arch=compute_$(a),code=sm_$(a))
+# LOOM: nvcc compiles each file's gencode targets in parallel (0 = all cores).
+ifdef LOOM_NVCC_THREADS
+NVCCFLAGS += --threads $(LOOM_NVCC_THREADS)
+endif
 
 ifdef LLAMA_PORTABLE
 

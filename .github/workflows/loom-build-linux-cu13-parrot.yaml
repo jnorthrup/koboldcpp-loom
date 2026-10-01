@@ -19,6 +19,7 @@ env:
   KCPP_APPEND: -parrot
   KCPP_JOBS: 12
   LOOM_SASS: 86 120
+  LOOM_NVCC_THREADS: 0
 
 jobs:
   linux:
@@ -54,6 +55,8 @@ jobs:
 
       - name: Build
         run: |
+          nproc; grep -m1 'model name' /proc/cpuinfo; free -g | head -2
+          (while sleep 60; do echo "LOAD $(cut -d' ' -f1-3 /proc/loadavg) MEMAVAIL_MB $(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)"; done) &
           ./koboldcpp.sh dist
           cd dist && for f in koboldcpp-linux-x64*; do sha256sum "$f"; stat -c '%n %s' "$f"; done
 
