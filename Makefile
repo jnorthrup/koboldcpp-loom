@@ -95,7 +95,9 @@ PARROT_LIBDIR = otherarch/parrot/target/release
 PARROT_LIB = $(PARROT_LIBDIR)/libkcpp_parrot.a
 CFLAGS += -DKCPP_PARROT
 CXXFLAGS += -DKCPP_PARROT
-LDFLAGS += $(PARROT_LIB)
+# The archive is linked via KOBOLDCPP_COMMON_OBJS (a real prerequisite), never via
+# LDFLAGS: helper tools (vulkan-shaders-gen, quantizers) link $(LDFLAGS) without
+# depending on it and raced the cargo build under -j.
 ifeq ($(UNAME_S),Darwin)
 LDFLAGS += -framework Foundation -framework CoreFoundation -framework Security -lc++
 else ifeq ($(OS),Windows_NT)
@@ -936,6 +938,9 @@ endif
 
 # common object files for all libraries
 KOBOLDCPP_COMMON_OBJS = gpttype_adapter_default.o whispercpp_default.o clip_default.o expose.o chat.o ggml-binops.o ggml-iqp.o ggml-unops.o ggml-backend.o ggml-backend-meta.o ggml-repack.o llama.o llama-model.o embeddings_default.o music_default.o tts_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o $(OBJS) $(OBJS_SDTYPE)
+ifdef KCPP_PARROT
+KOBOLDCPP_COMMON_OBJS += $(PARROT_LIB)
+endif
 
 #generated libraries
 koboldcpp_default: ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml_v3.o ggml_v2.o ggml_v1.o kcpp_backend_default.o ggml-backend-reg_default.o $(KOBOLDCPP_COMMON_OBJS) $(OBJS_FULL)
