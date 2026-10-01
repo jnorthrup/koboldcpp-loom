@@ -20,7 +20,9 @@ tts-rs = { version = "=2026.2.3", features = ["kokoro"] }
 # tts-rs declares ort = "2.0.0-rc.10", which semver-resolves to newer rcs with breaking
 # API changes (rc.13 fails to compile). Pin to what Parrot 26.2.4's Cargo.lock uses.
 ort = { version = "=2.0.0-rc.11", default-features = false }
-ort-sys = { version = "=2.0.0-rc.11", default-features = false }
+# ort's default tls-native needs a system OpenSSL, which the conda build env hides;
+# vendor it so the ONNX Runtime binary download builds the same everywhere.
+ort-sys = { version = "=2.0.0-rc.11", default-features = false, features = ["tls-native-vendored"] }
 
 [profile.release]
 opt-level = 3
