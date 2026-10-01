@@ -105,7 +105,7 @@ LDFLAGS += -lstdc++ -lpthread -ldl -lm -lrt
 endif
 TTS_PARROT_DEPS = $(PARROT_LIB)
 $(PARROT_LIB): otherarch/parrot/Cargo.toml otherarch/parrot/src/lib.rs
-	cd otherarch/parrot && cargo build --release
+	cd otherarch/parrot && env -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS -u MAKEFLAGS -u MFLAGS -u MAKELEVEL cargo build --release --locked
 endif
 
 FASTCFLAGS = $(subst -O3,-Ofast,$(CFLAGS))
