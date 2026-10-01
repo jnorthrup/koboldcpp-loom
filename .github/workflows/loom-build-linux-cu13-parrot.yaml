@@ -17,6 +17,7 @@ env:
   ARCHES_CU13: 1
   KCPP_PARROT: 1
   KCPP_APPEND: -parrot
+  KCPP_JOBS: 12
 
 jobs:
   linux:
