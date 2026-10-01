@@ -65,3 +65,27 @@ jobs:
         with:
           name: koboldcpp-loom-linux-x64-cuda1300-parrot
           path: dist/
+
+  # Hash-pinned home for the runtime: a GitHub release asset on this public
+  # repo (free storage and egress, fast from GPU pods). Consumers pin sha256.
+  release:
+    needs: linux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: koboldcpp-loom-linux-x64-cuda1300-parrot
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ inputs.commit_hash != '' && inputs.commit_hash || github.sha }}
+        run: |
+          cd dist
+          sha256sum koboldcpp-linux-x64* | tee SHA256SUMS
+          tag="loom-cu13-parrot-${SHA:0:9}"
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$SHA" \
+            --title "$tag" --notes "CUDA 13.0 + Parrot runtime from ${SHA}. Needs driver >= 580 (CUDA 13.0) and glibc >= 2.31." \
+            koboldcpp-linux-x64* SHA256SUMS
