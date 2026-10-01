@@ -19,7 +19,10 @@ path = "src/lib.rs"
 tts-rs = { version = "=2026.2.3", features = ["kokoro"] }
 # tts-rs declares ort = "2.0.0-rc.10", which semver-resolves to newer rcs with breaking
 # API changes (rc.13 fails to compile). Pin to what Parrot 26.2.4's Cargo.lock uses.
-ort = { version = "=2.0.0-rc.11", default-features = false }
+# load-dynamic: pyke's prebuilt static ONNX Runtime needs glibc 2.38 (__isoc23_strtol) and
+# cannot link into koboldcpp's portable (old-glibc) build. Load Microsoft's official
+# libonnxruntime.so 1.23.x at runtime instead (ORT_DYLIB_PATH, hash-pinned artifact).
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 # ort's default tls-native needs a system OpenSSL, which the conda build env hides;
 # vendor it so the ONNX Runtime binary download builds the same everywhere.
 ort-sys = { version = "=2.0.0-rc.11", default-features = false, features = ["tls-native-vendored"] }
