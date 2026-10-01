@@ -3568,6 +3568,22 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             }
         }
 
+        // LOOM: a GPU worker that silently falls back to CPU looks healthy but
+        // serves at CPU speed (e.g. CUDA13 runtime on a CUDA12.8 driver). With
+        // KCPP_REQUIRE_GPU=1, requested GPU layers without a GPU backend fail the load.
+        if (getenv("KCPP_REQUIRE_GPU") && std::string(getenv("KCPP_REQUIRE_GPU")) == "1" && inputs.gpulayers != 0)
+        {
+            bool has_gpu = false;
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) { has_gpu = true; }
+            }
+            if (!has_gpu)
+            {
+                fprintf(stderr, "%s: error: KCPP_REQUIRE_GPU=1 but no GPU backend initialized (driver too old for this CUDA runtime?)\n", __func__);
+                return ModelLoadResult::FAIL;
+            }
+        }
+
         llama_model * llamamodel = llama_model_load_from_file(kcpp_data->model_filename.c_str(), model_params);
         if (llamamodel == nullptr)
         {
