@@ -1,0 +1,6 @@
+{
+ "envelope_bytes": 23018585,
+ "continuation_chars": 110,
+ "refused_contextsize": "n_ctx differs: envelope 4096, local 8192",
+ "refused_quantkv": "kv_type_k differs: envelope 'f16', local 'q8_0'"
+}
