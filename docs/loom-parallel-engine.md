@@ -152,7 +152,56 @@ Interrogate (`/sdapi/v1/interrogate`) always uses the serial lane. Image generat
 
 ## Verification
 
-See `tests/test_parallel_runtime.py` and the evidence recorded in the commit messages for this branch.
+Host: Apple M3 Pro, 36 GiB, macOS 15.8.1, Metal. Build: `make -j11 LLAMA_METAL=1 KCPP_PARROT=1 koboldcpp_default` (exit 0).
+
+Model: `bartowski/Qwen_Qwen3.5-0.8B-GGUF@f36b1ea4` `Qwen_Qwen3.5-0.8B-Q4_K_M.gguf`, sha256 `fb044e93…9526`. It is a hybrid attention/recurrent model with 1 MTP layer, trained context 262144.
+
+Suite: `tests/test_parallel_runtime.py` passes 62/62 checks (`docs/evidence/parallel-run3-qwen35-0.8b.json`), and again after the post-v0.5.0 backports.
+
+- **Isolation:**
+  - Four concurrent greedy requests produce output byte-identical to their solo runs. Each contains only its own secret word.
+  - `peak_live=4`.
+  - Prompt token counts are unchanged under concurrency.
+- **MTP:**
+  - `draft-mtp` is active in both lanes. On this hybrid model rollback uses recurrent snapshots (`n_rs_seq=3`).
+  - With EOS banned, every request reports exactly 40 completion tokens and `draft_accepted <= draft_tokens`.
+- **Admission:**
+  - Chat `input_tokens` (22) equals `usage.prompt_tokens`.
+  - `max_tokens = n_ctx - 22` is admitted. One more returns 400 `exceed_context_size_error` with `n_prompt_tokens=22, n_ctx=4096`, including for `stream: true` before any SSE bytes.
+  - A 5001-token prompt is rejected with its exact untruncated count.
+  - A 3001-token prompt asking for 2000 completion tokens is rejected; asking for 64 is admitted.
+- **Samplers:** grammar, DRY+XTC and mirostat run concurrently. Grammar output is constrained, and the neighbouring request is unaffected.
+- **Cancellation:** a keyed abort stopped request A at 67/1200 tokens while B completed 1200/1200. Exactly one abort was counted.
+- **Rejections:**
+  - At startup, parallel without `--noshift`, `--smartcontext`, and `--ropescaling` with `--overridenativecontext` each exit 2 with an explicit message.
+  - Phrase bans and image input return 400 `not_supported_error`.
+  - `--parallelserial` routes a phrase-ban request to the serial lane and still serves parallel requests.
+
+Throughput (`tests/bench_parallel_runtime.py`, 128 greedy tokens, `docs/evidence/bench-qwen35-0.8b-vs-llama-server-v0.5.0.json`):
+
+| config | 4 concurrent, aggregate tok/s | draft acceptance |
+| --- | --- | --- |
+| Kobold serial lane | 126 | – |
+| Kobold serial lane + MTP | 78 | 0.361 |
+| Kobold parallel lane (4 slots) | 193 | – |
+| Kobold parallel lane + MTP | 157 | 0.361 |
+| upstream llama-server v0.5.0 `-np 4` | 202 | – |
+| upstream llama-server v0.5.0 `-np 4` + MTP | 157 | 0.358 |
+
+The parallel lane is within about 5% of upstream without MTP and matches it with MTP. Draft and accept counts match upstream within one token.
+
+On this 0.8B model MTP is slower than no-MTP in both implementations: acceptance of about 36% doesn't pay for the extra draft head and verification. That measures this model, not the integration.
+
+Context profiles (`docs/evidence/profiles-qwen35-0.8b-128k-1m.json`; q8_0 KV, MTP draft 2, serial lane):
+
+| requested | allocated cells | RoPE | target KV | MTP KV | passkey 4K / 32K |
+| --- | --- | --- | --- | --- | --- |
+| 131072 | 131328 | none | 875 MiB | 136 MiB | found / found |
+| 262144 | 262400 | none | 1691 MiB | 272 MiB | found / found |
+| 524288 | 524544 | YaRN ×2 (orig 262144) | 3323 MiB | 544 MiB | found / found |
+| 1048576 | 1048832 | YaRN ×4 | 6587 MiB | 1088 MiB | found / found |
+
+All four allocate and generate with MTP active. The shallow passkey probes show the scaled configurations still read early context. They are not evidence of quality at full depth; see deep probes below.
 
 ## Remaining limitations
 
