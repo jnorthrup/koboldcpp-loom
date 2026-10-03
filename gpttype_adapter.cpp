@@ -1013,6 +1013,7 @@ static void speculative_decoding_setup(std::string spec_model_filename, llama_co
     draft_model_params.devices = base_model_params.devices;
     draft_model_params.load_mtp = true;
     draft_ctx_params.n_ctx = base_ctx_params.n_ctx;
+    draft_ctx_params.n_seq_max = base_ctx_params.n_seq_max; //one draft sequence per target sequence (parallel slots)
     draft_ctx_params.offload_kqv = base_ctx_params.offload_kqv;
     draft_model_params.main_gpu = base_model_params.main_gpu;
     draft_model_params.split_mode = llama_split_mode::LLAMA_SPLIT_MODE_LAYER;
@@ -3986,7 +3987,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
                     (batch_tgt_seq_rm == COMMON_CONTEXT_SEQ_RM_TYPE_RS && (int) llama_n_rs_seq(llama_ctx_v4) >= speculative_chunk_amt);
                 if(!draft_is_mtp || draft_spec_type_active != COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
                 {
-                    fprintf(stderr, "\nError: parallel requests support built-in MTP drafting only (active speculative type: %s). Remove --draftmodel or use --parallelrequests 1.\n", common_speculative_type_to_str(draft_spec_type_active).c_str());
+                    fprintf(stderr, "\nError: parallel requests support MTP drafting only (built-in, or an MTP-head --draftmodel); active speculative type: %s. Use --parallelrequests 1 for this draft model.\n", common_speculative_type_to_str(draft_spec_type_active).c_str());
                     return ModelLoadResult::FAIL;
                 }
                 if(!rollback_ok)

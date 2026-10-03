@@ -2178,8 +2178,8 @@ def load_model(model_filename):
             conflicts.append("--smartcache")
         if getattr(args, "loomcache", False):
             conflicts.append("--loomcache")
-        if args.draftmodel:
-            conflicts.append("--draftmodel (parallel drafting supports built-in MTP only, use --usemtp)")
+        # --draftmodel is allowed when it is an MTP head (e.g. a separate mtp-*.gguf); other draft types
+        # are rejected by the native loader for parallel mode with an explicit error.
         if not args.noshift and not args.nofastforward: # --nofastforward implies noshift
             conflicts.append("context shifting (add --noshift: overflowing parallel requests are rejected, not shifted)")
         if conflicts:
