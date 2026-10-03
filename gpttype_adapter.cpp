@@ -9131,6 +9131,114 @@ bool gpttype_load_state_kv(int slot)
     }
     return false;
 }
+//LOOMKV: portable slot export/import. A slot is a committed snapshot (main KV, optional draft KV, logits, tokens).
+//which: 0 main KV, 1 draft KV, 2 logits (float32 x n_vocab), 3 tokens (int32). dst==nullptr returns the byte size.
+//Returns 0 when the slot is empty or holds media state (the envelope does not carry media).
+size_t gpttype_state_slot_section(int slot, int which, uint8_t * dst, size_t cap)
+{
+    if(kcpp_data==nullptr || file_format!=FileFormat::GGUF_GENERIC || slot<0 || slot>=(int)savestates.size())
+    {
+        return 0;
+    }
+    const savestate_data & st = savestates[slot];
+    if(st.current_savestate_buffer.empty() || st.media_signature!="")
+    {
+        return 0;
+    }
+    const uint8_t * src = nullptr;
+    size_t n = 0;
+    switch(which)
+    {
+        case 0: src = st.current_savestate_buffer.data(); n = st.current_savestate_size; break;
+        case 1: src = st.current_draft_savestate_buffer.data(); n = st.current_draft_savestate_size; break;
+        case 2: src = (const uint8_t *) st.latest_logits.data(); n = st.latest_logits.size()*sizeof(float); break;
+        case 3: src = (const uint8_t *) st.savestate_context_tokens.data(); n = st.savestate_context_tokens.size()*sizeof(int32_t); break;
+        default: return 0;
+    }
+    if(dst==nullptr)
+    {
+        return n;
+    }
+    if(n==0 || cap<n)
+    {
+        return 0;
+    }
+    memcpy(dst, src, n);
+    return n;
+}
+//Fill a slot from imported bytes. Nothing is handed to llama.cpp here; gpttype_load_state_kv(slot) does that and
+//llama_state_set_data validates the size against the live context. Sizes are checked before the slot is touched.
+bool gpttype_state_slot_import(int slot, const int32_t * tokens, size_t n_tokens, const uint8_t * main_kv, size_t main_n,
+                               const uint8_t * draft_kv, size_t draft_n, const uint8_t * logits, size_t logits_n)
+{
+    if(kcpp_data==nullptr || file_format!=FileFormat::GGUF_GENERIC || slot<0 || slot>=(int)savestates.size())
+    {
+        return false;
+    }
+    //llama_state_get_size grows with the cells in use, so a fresh context cannot be compared by size; the track check
+    //in loomstate.py gates identity and llama_state_set_data (in gpttype_load_state_kv) validates the layout.
+    if(main_kv==nullptr || main_n==0)
+    {
+        return false;
+    }
+    if(draft_n>0 && draft_ctx==nullptr)
+    {
+        return false;
+    }
+    if(draft_n==0 && draft_ctx!=nullptr)
+    {
+        return false; //local MTP/draft head needs its state; importing without it would desync drafting
+    }
+    if(logits_n!=0 && logits_n!=(size_t)n_vocab*sizeof(float))
+    {
+        return false;
+    }
+    savestate_data & st = savestates[slot];
+    if(slot < (int)loom_slot_fork.size())
+    {
+        loom_slot_fork[slot] = 0;
+    }
+    try
+    {
+        st.current_savestate_buffer.assign(main_kv, main_kv+main_n);
+        st.current_savestate_buffer.resize(main_n + 512);
+        st.current_draft_savestate_buffer.clear();
+        if(draft_n>0)
+        {
+            st.current_draft_savestate_buffer.assign(draft_kv, draft_kv+draft_n);
+            st.current_draft_savestate_buffer.resize(draft_n + 512);
+        }
+    }
+    catch(const std::bad_alloc&)
+    {
+        st.current_savestate_buffer.clear();
+        st.current_draft_savestate_buffer.clear();
+        st.current_savestate_size = 0;
+        st.current_draft_savestate_size = 0;
+        return false;
+    }
+    st.current_savestate_size = main_n;
+    st.current_draft_savestate_size = draft_n;
+    st.savestate_context_tokens.assign(tokens, tokens+n_tokens);
+    st.latest_logits.assign((const float *) logits, (const float *) logits + logits_n/sizeof(float));
+    st.media_signature = "";
+    touch_slot(slot);
+    return true;
+}
+//identity strings the importer compares against the envelope track (see loomstate.py)
+std::string gpttype_state_arch()
+{
+    if(kcpp_data==nullptr || file_format!=FileFormat::GGUF_GENERIC || llama_ctx_v4==nullptr)
+    {
+        return "";
+    }
+    char buf[128] = {0};
+    if(llama_model_meta_val_str(llama_get_model(llama_ctx_v4), "general.architecture", buf, sizeof(buf)) < 0)
+    {
+        return "";
+    }
+    return std::string(buf);
+}
 bool gpttype_clear_state_kv(bool shrink)
 {
     if(kcpp_data==nullptr)

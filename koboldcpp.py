@@ -1077,6 +1077,12 @@ def init_library():
     handle.load_state_kv.argtypes = [ctypes.c_int]
     handle.load_state_kv.restype = ctypes.c_bool
     handle.clear_state_kv.restype = ctypes.c_bool
+    handle.state_slot_section.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+    handle.state_slot_section.restype = ctypes.c_size_t
+    handle.state_slot_import.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
+                                         ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
+    handle.state_slot_import.restype = ctypes.c_bool
+    handle.state_arch.restype = ctypes.c_char_p
     handle.sd_load_model.argtypes = [sd_load_model_inputs]
     handle.sd_load_model.restype = ctypes.c_bool
     handle.sd_generate.argtypes = [sd_generation_inputs]
@@ -1610,6 +1616,106 @@ def loomstore_dispatch(handler, method, clean_path, body):
     handler.end_headers(content_type=ctype)
     handler.wfile.write(payload)
     return True
+
+_loomstate_track_cache = None
+
+def loomstate_track():
+    """Identity an exported envelope is bound to and an import is checked against (see loomstate.py)."""
+    global _loomstate_track_cache
+    import loomstate
+    if _loomstate_track_cache is None:
+        qkvstr = str(getattr(args, "quantkv", "f16") or "f16").lower()
+        kvt = {"f16": "f16", "0": "f16", "bf16": "bf16", "3": "bf16", "q8_0": "q8_0", "1": "q8_0", "q5_1": "q5_1", "q4_0": "q4_0", "2": "q4_0"}.get(qkvstr, qkvstr)
+        libpath = libname if os.path.isabs(libname) else os.path.join(os.path.dirname(os.path.abspath(__file__)), libname)
+        kv_v = kvt if (not args.noflashattention or kvt == "bf16") else "f16"
+        kv_k = kvt
+        _loomstate_track_cache = {
+            "model_sha256": loomstate.file_sha256(args.model_param),
+            "kv_type_k": kv_k,
+            "kv_type_v": kv_v,
+            "n_ctx": int(args.contextsize),
+            "engine": "koboldcpp-loom/%s/%s" % (KcppVersion, loomstate.file_sha256(libpath)),
+            "backend": os.path.splitext(os.path.basename(libname))[0].replace("koboldcpp_", "") + ("+metal" if sys.platform == "darwin" else ""),
+            "arch": (handle.state_arch() or b"").decode("utf-8", "replace"),
+        }
+    return dict(_loomstate_track_cache)
+
+def loomstate_export(slot, state_class="session"):
+    import loomstate
+    sizes = [handle.state_slot_section(slot, w, None, 0) for w in range(4)]
+    if sizes[0] == 0 or sizes[3] == 0:
+        raise loomstate.LoomStateError("empty_slot", "slot %d holds no exportable state (empty or media-bearing)" % slot)
+    blobs = []
+    for w in range(4):
+        buf = ctypes.create_string_buffer(max(sizes[w], 1))
+        if sizes[w] and handle.state_slot_section(slot, w, ctypes.addressof(buf), sizes[w]) != sizes[w]:
+            raise loomstate.LoomStateError("export_failed", "section %d copy failed" % w)
+        blobs.append(buf.raw[:sizes[w]])
+    tokens = list(struct.unpack("<%di" % (sizes[3] // 4), blobs[3]))
+    sections = [("main", blobs[0])] + ([("draft", blobs[1])] if blobs[1] else []) + ([("logits", blobs[2])] if blobs[2] else [])
+    return loomstate.build_envelope(loomstate_track(), tokens, sections, state_class=state_class)
+
+def loomstate_import(slot, data, load=False, expected_parent_sha256=None):
+    """Verify first, then hand to the engine. Returns (n_tokens, loaded)."""
+    import loomstate
+    desc, secs, _ = loomstate.parse_envelope(data, loomstate_track(), expected_parent_sha256=expected_parent_sha256)
+    toks = desc["tokens"]
+    tarr = (ctypes.c_int32 * max(len(toks), 1))(*toks)
+    main, draft, logits = secs.get("main", b""), secs.get("draft", b""), secs.get("logits", b"")
+    mb, db, lb = ctypes.create_string_buffer(main, max(len(main), 1)), ctypes.create_string_buffer(draft, max(len(draft), 1)), ctypes.create_string_buffer(logits, max(len(logits), 1))
+    if not handle.state_slot_import(slot, ctypes.addressof(tarr), len(toks), ctypes.addressof(mb), len(main),
+                                    ctypes.addressof(db), len(draft), ctypes.addressof(lb), len(logits)):
+        raise loomstate.LoomStateError("engine_refused", "engine rejected the state (size/layout does not match the loaded context)")
+    loaded = bool(handle.load_state_kv(slot)) if load else False
+    if load and not loaded:
+        raise loomstate.LoomStateError("load_failed", "llama.cpp refused the imported state")
+    return len(toks), loaded
+
+def loomstate_dispatch(handler, clean_path, body):
+    """/api/admin/export_state and /api/admin/import_state (LOOMKV01 envelopes). Returns True when handled."""
+    if clean_path not in ("/api/admin/export_state", "/api/admin/import_state"):
+        return False
+    import loomstate
+    def reply(code, payload, ctype='application/json'):
+        if not isinstance(payload, (bytes, bytearray)):
+            payload = json.dumps(payload).encode()
+        handler.send_response(code)
+        handler.send_header('content-length', str(len(payload)))
+        handler.end_headers(content_type=ctype)
+        handler.wfile.write(payload)
+        return True
+    if not (args.admin and args.admindir and os.path.exists(args.admindir) and handler.check_header_password(args.adminpassword)):
+        return reply(401, {"success": False, "error": "admin access required"})
+    if savestate_limit <= 0:
+        return reply(409, {"success": False, "code": "no_slots", "error": "state export needs --smartcache slots"})
+    if batched_request_runner_count > 0 or not modelbusy.acquire(timeout=5): #a finished request releases the lock just after its response is sent
+        return reply(503, {"success": False, "code": "busy", "error": "model is busy; export/import only runs on an idle engine"})
+    try:
+        return loomstate_handle(handler, clean_path, body, reply)
+    finally:
+        modelbusy.release()
+
+def loomstate_handle(handler, clean_path, body, reply):
+    import loomstate
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
+    try:
+        if clean_path.endswith("export_state"):
+            req = json.loads(body) if body else {}
+            slot = int(req.get("slot", 0)) if isinstance(req, dict) else 0
+            if not 0 <= slot < savestate_limit:
+                return reply(400, {"success": False, "code": "bad_slot", "error": "slot out of range"})
+            env = loomstate_export(slot, state_class=(req.get("class", "session") if isinstance(req, dict) else "session"))
+            return reply(200, env, 'application/octet-stream')
+        slot = int(query.get("slot", ["0"])[0])
+        if not 0 <= slot < savestate_limit:
+            return reply(400, {"success": False, "code": "bad_slot", "error": "slot out of range"})
+        load = query.get("load", ["0"])[0] in ("1", "true")
+        n, loaded = loomstate_import(slot, body or b"", load=load, expected_parent_sha256=(query.get("parent", [None])[0]))
+        return reply(200, {"success": True, "tokens": n, "loaded": loaded, "slot": slot})
+    except loomstate.LoomStateError as e:
+        return reply(422, {"success": False, "code": e.code, "error": e.msg})
+    except (ValueError, TypeError) as e:
+        return reply(400, {"success": False, "code": "bad_request", "error": str(e)})
 
 def get_current_admindir_list():
     opts = []
@@ -7473,6 +7579,8 @@ Change Mode<br>
         response_code = 200
 
         if loomstore_dispatch(self, "POST", clean_path, body):
+            return
+        if loomstate_dispatch(self, clean_path, body):
             return
 
         if clean_path.endswith('/api/extra/tokencount') or clean_path.endswith('/api/extra/tokenize'):

@@ -35,6 +35,12 @@ Persistent state: the continuum from "a user's KV cache" to "a GPU's token dump"
                       and arch all match; on refusal the caller replays the recipe with --prewarm.
                       Size is not GB-scale on hybrid models (Qwen3.8-27B: ~290 MiB per 4K-token q8_0
                       branch; only 16 of 64 layers keep KV) - dense models are ~4x larger.
-                      Done: envelope + refuse-on-mismatch (tests/test_loomstate.py).
-                      Not done: engine export/import endpoints, signing (mesh side), GCS placement.
+                      Done: envelope + refuse-on-mismatch (tests/test_loomstate.py); engine
+                      endpoints POST /api/admin/export_state {slot} and
+                      POST /api/admin/import_state?slot=N&load=0|1[&parent=sha256] (admin auth, idle
+                      engine, needs --smartcache); cross-process round trip continues byte-identically
+                      (tests/test_loomstate_roundtrip.py).
+                      Limits: SmartCache slot = whole-context snapshot, serial lane only; media-bearing
+                      slots are not exportable; the track hashes the model file and the engine library.
+                      Not done: per-sequence export for parallel slots, mesh signing, GCS placement.
   Hosting/billing proposal: runpod experiments/loom/docs/looms-hosting-proposal.md.

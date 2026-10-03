@@ -533,6 +533,20 @@ extern "C"
     {
         return gpttype_load_state_kv(slot);
     }
+    size_t state_slot_section(int slot, int which, uint8_t * dst, size_t cap) //LOOMKV export: copy one section of a savestate slot
+    {
+        return gpttype_state_slot_section(slot, which, dst, cap);
+    }
+    bool state_slot_import(int slot, const int32_t * tokens, size_t n_tokens, const uint8_t * main_kv, size_t main_n, const uint8_t * draft_kv, size_t draft_n, const uint8_t * logits, size_t logits_n)
+    {
+        return gpttype_state_slot_import(slot, tokens, n_tokens, main_kv, main_n, draft_kv, draft_n, logits, logits_n);
+    }
+    const char * state_arch()
+    {
+        static std::string arch;
+        arch = gpttype_state_arch();
+        return arch.c_str();
+    }
     bool clear_state_kv()
     {
         return gpttype_clear_state_kv(true);
