@@ -31,6 +31,7 @@ CTX = 4096
 SLOTS = 4
 DRAFT = 3
 LONG_N = 1200
+EXPECT_MTP = os.environ.get("KCPP_TEST_EXPECT_MTP", "1") == "1" # set 0 for models without MTP layers
 EVIDENCE = {}
 HTTP_TIMEOUT = int(os.environ.get("KCPP_TEST_HTTP_TIMEOUT", "600"))
 
@@ -174,14 +175,15 @@ def test_startup_rejections():
 def test_parallel_engine():
     if not MODEL:
         return
-    srv = Server("parallel", ["--parallelrequests", str(SLOTS), "--noshift", "--usemtp", "--draftamount", str(DRAFT),
+    mtp_args = ["--usemtp", "--draftamount", str(DRAFT)] if EXPECT_MTP else []
+    srv = Server("parallel", ["--parallelrequests", str(SLOTS), "--noshift"] + mtp_args + [
                               "--multiuser", "16"]).start()
     ev = {"load_seconds": srv.load_seconds}
     try:
         rt = srv.runtime()
         ev["runtime_at_start"] = rt
         check("parallel enabled", rt["parallel"]["enabled"] and rt["parallel"]["slots"] == SLOTS, rt["parallel"])
-        check("mtp active", rt["mtp"]["active"] and rt["mtp"]["parallel_lane"] and rt["mtp"]["speculative_type"] == "draft-mtp", rt["mtp"])
+        check("mtp active", (not EXPECT_MTP) or rt["mtp"]["active"] and rt["mtp"]["parallel_lane"] and rt["mtp"]["speculative_type"] == "draft-mtp", rt["mtp"])
 
         # solo baselines, then the same four requests concurrently
         solo = {}
@@ -219,7 +221,7 @@ def test_parallel_engine():
         drafted = sum(c["draft_tokens"] for c in counters)
         accepted = sum(c["draft_accepted"] for c in counters)
         ev["counters"] = {"per_request": counters, "drafted": drafted, "accepted": accepted}
-        check("mtp drafted in parallel lane", drafted > 0 and accepted > 0, ev["counters"])
+        check("mtp drafted in parallel lane", (drafted > 0 and accepted > 0) if EXPECT_MTP else drafted == 0, ev["counters"])
         rt3 = srv.runtime()
         check("runtime totals carry draft counters", rt3["parallel"]["totals"]["draft_tokens"] >= drafted, rt3["parallel"]["totals"])
 
@@ -325,6 +327,36 @@ def test_parallelserial_routing():
         EVIDENCE["parallelserial"] = ev
 
 
+def test_prefix_reuse():
+    """Attention-only models: a finished slot keeps its tokens and the next request reuses the shared prefix.
+    Hybrid/recurrent models report fastforward=false and are skipped."""
+    if not MODEL:
+        return
+    srv = Server("prefix_reuse", ["--parallelrequests", "2", "--noshift", "--multiuser", "8"]).start()
+    ev = {}
+    try:
+        rt = srv.runtime()
+        ev["fastforward"] = rt["parallel"]["fastforward"]
+        ev["target_seq_rm"] = rt["parallel"]["target_seq_rm"]
+        if not rt["parallel"]["fastforward"]:
+            ev["skipped"] = "model memory cannot truncate a sequence (seq_rm=%s)" % rt["parallel"]["target_seq_rm"]
+            return
+        base = "You are a librarian. " * 120
+        st1, b1 = gen(srv, base + "Question one: name a poet.", 8)
+        reused0 = srv.runtime()["parallel"]["totals"]["reused_tokens"]
+        st2, b2 = gen(srv, base + "Question two: name a novel.", 8)
+        reused1 = srv.runtime()["parallel"]["totals"]["reused_tokens"]
+        st3, b3 = gen(srv, base + "Question two: name a novel.", 8)
+        ev.update({"prompt_tokens": b2["results"][0]["prompt_tokens"], "reused_second": reused1 - reused0,
+                   "same_prompt_identical": b2["results"][0]["text"] == b3["results"][0]["text"]})
+        check("prefix reuse requests ok", st1 == 200 and st2 == 200 and st3 == 200, ev)
+        check("prefix reused for shared prefix", reused1 - reused0 > 100, ev)
+        check("reused prefix gives identical greedy output", ev["same_prompt_identical"], ev)
+    finally:
+        srv.stop()
+        EVIDENCE["prefix_reuse"] = ev
+
+
 PROFILE_LINE = re.compile(r"Context profile: .*")
 FILLER = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
 
@@ -384,7 +416,7 @@ def main():
         print("KCPP_TEST_MODEL is not set; nothing to run")
         return 0
     failures = []
-    for t in (test_startup_rejections, test_parallel_engine, test_parallelserial_routing, test_context_profiles):
+    for t in (test_startup_rejections, test_parallel_engine, test_parallelserial_routing, test_prefix_reuse, test_context_profiles):
         try:
             t()
             print("PASS", t.__name__)

@@ -3977,7 +3977,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         }
         if(continuous_batching_slots > 0)
         {
-            batch_fastforward = (batch_tgt_seq_rm == COMMON_CONTEXT_SEQ_RM_TYPE_PART);
+            batch_fastforward = kcpp_data->use_fastforward && (batch_tgt_seq_rm == COMMON_CONTEXT_SEQ_RM_TYPE_PART); //--nofastforward always reprocesses
             batch_spec_enabled = false;
             batch_spec_dft_rollback = false;
             if(draft_spec)

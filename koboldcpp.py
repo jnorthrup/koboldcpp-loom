@@ -2180,7 +2180,7 @@ def load_model(model_filename):
             conflicts.append("--loomcache")
         if args.draftmodel:
             conflicts.append("--draftmodel (parallel drafting supports built-in MTP only, use --usemtp)")
-        if not args.noshift:
+        if not args.noshift and not args.nofastforward: # --nofastforward implies noshift
             conflicts.append("context shifting (add --noshift: overflowing parallel requests are rejected, not shifted)")
         if conflicts:
             exit_with_error(2, "--parallelrequests %d cannot be combined with: %s. Use --parallelrequests 1 for these serial features." % (args.parallelrequests, ", ".join(conflicts)))

@@ -1,0 +1,1449 @@
+{
+ "checks": [
+  {
+   "name": "startup rejects no_noshift",
+   "ok": true,
+   "detail": {
+    "exit": 2,
+    "message": "--parallelrequests 2 cannot be combined with: context shifting (add --noshift: overflowing parallel requests are rejected, not shifted). Use --parallelrequests 1 for these serial features."
+   }
+  },
+  {
+   "name": "startup rejects smartcontext",
+   "ok": true,
+   "detail": {
+    "exit": 2,
+    "message": "--parallelrequests 2 cannot be combined with: --smartcontext. Use --parallelrequests 1 for these serial features."
+   }
+  },
+  {
+   "name": "startup rejects rope_conflict",
+   "ok": true,
+   "detail": {
+    "exit": 2,
+    "message": "--ropescaling cannot be combined with --overridenativecontext (both define the RoPE adjustment)."
+   }
+  },
+  {
+   "name": "parallel enabled",
+   "ok": true,
+   "detail": {
+    "cached_cells": 0,
+    "enabled": true,
+    "fastforward": true,
+    "live": 0,
+    "n_ctx_seq": 4352,
+    "n_seq_max": 5,
+    "pool_cells": 4352,
+    "reserved_cells": 0,
+    "serial_lane_active": false,
+    "serial_lane_waiting": 0,
+    "slot_list": [
+     {
+      "cached_tokens": 0,
+      "id": 0,
+      "id_task": -1,
+      "is_processing": false,
+      "kv_cells": 0,
+      "n_ctx": 4352,
+      "seq_id": 1,
+      "state": "idle"
+     },
+     {
+      "cached_tokens": 0,
+      "id": 1,
+      "id_task": -1,
+      "is_processing": false,
+      "kv_cells": 0,
+      "n_ctx": 4352,
+      "seq_id": 2,
+      "state": "idle"
+     },
+     {
+      "cached_tokens": 0,
+      "id": 2,
+      "id_task": -1,
+      "is_processing": false,
+      "kv_cells": 0,
+      "n_ctx": 4352,
+      "seq_id": 3,
+      "state": "idle"
+     },
+     {
+      "cached_tokens": 0,
+      "id": 3,
+      "id_task": -1,
+      "is_processing": false,
+      "kv_cells": 0,
+      "n_ctx": 4352,
+      "seq_id": 4,
+      "state": "idle"
+     }
+    ],
+    "slots": 4,
+    "target_seq_rm": "part",
+    "totals": {
+     "aborted": 0,
+     "completed": 0,
+     "completion_tokens": 0,
+     "decode_calls": 0,
+     "draft_accepted": 0,
+     "draft_tokens": 0,
+     "failed": 0,
+     "peak_live": 0,
+     "prompt_tokens": 0,
+     "rejected_context": 0,
+     "rejected_unsupported": 0,
+     "reused_tokens": 0,
+     "submitted": 0
+    },
+    "waiting": 0
+   }
+  },
+  {
+   "name": "mtp active",
+   "ok": true,
+   "detail": {
+    "active": false,
+    "checkpoint_rollback": false,
+    "n_draft_max": 0,
+    "n_rs_seq": 0,
+    "parallel_lane": false,
+    "requested": false,
+    "serial_lane": false,
+    "speculative_type": "none",
+    "status": "not requested"
+   }
+  },
+  {
+   "name": "solo ZEBRA ok",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " ZEBRA. The secret word is ZEBRA.",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 36,
+      "completion_tokens": 12,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "solo MANGO ok",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " MANGO. The secret word is MANGO. The secret",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 32,
+      "completion_tokens": 12,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "solo VIOLET ok",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " VIOLET. The secret word is VIOLET.",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 36,
+      "completion_tokens": 12,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "solo COPPER ok",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " COPPER. The secret word is COPPER. The secret",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 32,
+      "completion_tokens": 12,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "concurrent ZEBRA ok",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " ZEBRA. The secret word is ZEBRA.",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 36,
+      "completion_tokens": 12,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "isolation ZEBRA own word",
+   "ok": true,
+   "detail": {
+    "text": " ZEBRA. The secret word is ZEBRA.",
+    "solo_text": " ZEBRA. The secret word is ZEBRA.",
+    "identical_to_solo": true,
+    "prompt_tokens": 36,
+    "completion_tokens": 12,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "isolation ZEBRA no foreign word",
+   "ok": true,
+   "detail": {
+    "foreign": [],
+    "text": " ZEBRA. The secret word is ZEBRA."
+   }
+  },
+  {
+   "name": "prompt tokens stable ZEBRA",
+   "ok": true,
+   "detail": {
+    "text": " ZEBRA. The secret word is ZEBRA.",
+    "solo_text": " ZEBRA. The secret word is ZEBRA.",
+    "identical_to_solo": true,
+    "prompt_tokens": 36,
+    "completion_tokens": 12,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "concurrent MANGO ok",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " MANGO. The secret word is MANGO. The secret",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 32,
+      "completion_tokens": 12,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "isolation MANGO own word",
+   "ok": true,
+   "detail": {
+    "text": " MANGO. The secret word is MANGO. The secret",
+    "solo_text": " MANGO. The secret word is MANGO. The secret",
+    "identical_to_solo": true,
+    "prompt_tokens": 32,
+    "completion_tokens": 12,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "isolation MANGO no foreign word",
+   "ok": true,
+   "detail": {
+    "foreign": [],
+    "text": " MANGO. The secret word is MANGO. The secret"
+   }
+  },
+  {
+   "name": "prompt tokens stable MANGO",
+   "ok": true,
+   "detail": {
+    "text": " MANGO. The secret word is MANGO. The secret",
+    "solo_text": " MANGO. The secret word is MANGO. The secret",
+    "identical_to_solo": true,
+    "prompt_tokens": 32,
+    "completion_tokens": 12,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "concurrent VIOLET ok",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " VIOLET. The secret word is VIOLET.",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 36,
+      "completion_tokens": 12,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "isolation VIOLET own word",
+   "ok": true,
+   "detail": {
+    "text": " VIOLET. The secret word is VIOLET.",
+    "solo_text": " VIOLET. The secret word is VIOLET.",
+    "identical_to_solo": true,
+    "prompt_tokens": 36,
+    "completion_tokens": 12,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "isolation VIOLET no foreign word",
+   "ok": true,
+   "detail": {
+    "foreign": [],
+    "text": " VIOLET. The secret word is VIOLET."
+   }
+  },
+  {
+   "name": "prompt tokens stable VIOLET",
+   "ok": true,
+   "detail": {
+    "text": " VIOLET. The secret word is VIOLET.",
+    "solo_text": " VIOLET. The secret word is VIOLET.",
+    "identical_to_solo": true,
+    "prompt_tokens": 36,
+    "completion_tokens": 12,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "concurrent COPPER ok",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " COPPER. The secret word is COPPER. The secret",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 32,
+      "completion_tokens": 12,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "isolation COPPER own word",
+   "ok": true,
+   "detail": {
+    "text": " COPPER. The secret word is COPPER. The secret",
+    "solo_text": " COPPER. The secret word is COPPER. The secret",
+    "identical_to_solo": true,
+    "prompt_tokens": 32,
+    "completion_tokens": 12,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "isolation COPPER no foreign word",
+   "ok": true,
+   "detail": {
+    "foreign": [],
+    "text": " COPPER. The secret word is COPPER. The secret"
+   }
+  },
+  {
+   "name": "prompt tokens stable COPPER",
+   "ok": true,
+   "detail": {
+    "text": " COPPER. The secret word is COPPER. The secret",
+    "solo_text": " COPPER. The secret word is COPPER. The secret",
+    "identical_to_solo": true,
+    "prompt_tokens": 32,
+    "completion_tokens": 12,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "requests overlapped in slots",
+   "ok": true,
+   "detail": {
+    "aborted": 0,
+    "completed": 8,
+    "completion_tokens": 96,
+    "decode_calls": 61,
+    "draft_accepted": 0,
+    "draft_tokens": 0,
+    "failed": 0,
+    "peak_live": 4,
+    "prompt_tokens": 272,
+    "rejected_context": 0,
+    "rejected_unsupported": 0,
+    "reused_tokens": 16,
+    "submitted": 8
+   }
+  },
+  {
+   "name": "ban_eos ok",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " ZEBRA. The secret word is ZEBRA. The secret word is ZEBRA. The secret word is ZEBRA. The secret word is ZEBRA. The secret word is",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 36,
+      "completion_tokens": 40,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "completion_tokens exact",
+   "ok": true,
+   "detail": {
+    "text": " ZEBRA. The secret word is ZEBRA. The secret word is ZEBRA. The secret word is ZEBRA. The secret word is ZEBRA. The secret word is",
+    "tool_calls": [],
+    "finish_reason": "length",
+    "logprobs": null,
+    "prompt_tokens": 36,
+    "completion_tokens": 40,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "draft_accepted <= draft_tokens",
+   "ok": true,
+   "detail": {
+    "text": " ZEBRA. The secret word is ZEBRA. The secret word is ZEBRA. The secret word is ZEBRA. The secret word is ZEBRA. The secret word is",
+    "tool_calls": [],
+    "finish_reason": "length",
+    "logprobs": null,
+    "prompt_tokens": 36,
+    "completion_tokens": 40,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "ban_eos ok",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " MANGO. The secret word is MANGO. The secret word is MANGO. The secret word is MANGO. The secret word is MANGO. The secret word is MANGO. The secret",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 32,
+      "completion_tokens": 40,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "completion_tokens exact",
+   "ok": true,
+   "detail": {
+    "text": " MANGO. The secret word is MANGO. The secret word is MANGO. The secret word is MANGO. The secret word is MANGO. The secret word is MANGO. The secret",
+    "tool_calls": [],
+    "finish_reason": "length",
+    "logprobs": null,
+    "prompt_tokens": 32,
+    "completion_tokens": 40,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "draft_accepted <= draft_tokens",
+   "ok": true,
+   "detail": {
+    "text": " MANGO. The secret word is MANGO. The secret word is MANGO. The secret word is MANGO. The secret word is MANGO. The secret word is MANGO. The secret",
+    "tool_calls": [],
+    "finish_reason": "length",
+    "logprobs": null,
+    "prompt_tokens": 32,
+    "completion_tokens": 40,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "ban_eos ok",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " VIOLET. The secret word is VIOLET. The secret word is VIOLET. The secret word is VIOLET. The secret word is VIOLET. The secret word is",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 36,
+      "completion_tokens": 40,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "completion_tokens exact",
+   "ok": true,
+   "detail": {
+    "text": " VIOLET. The secret word is VIOLET. The secret word is VIOLET. The secret word is VIOLET. The secret word is VIOLET. The secret word is",
+    "tool_calls": [],
+    "finish_reason": "length",
+    "logprobs": null,
+    "prompt_tokens": 36,
+    "completion_tokens": 40,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "draft_accepted <= draft_tokens",
+   "ok": true,
+   "detail": {
+    "text": " VIOLET. The secret word is VIOLET. The secret word is VIOLET. The secret word is VIOLET. The secret word is VIOLET. The secret word is",
+    "tool_calls": [],
+    "finish_reason": "length",
+    "logprobs": null,
+    "prompt_tokens": 36,
+    "completion_tokens": 40,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "ban_eos ok",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " COPPER. The secret word is COPPER. The secret word is COPPER. The secret word is COPPER. The secret word is COPPER. The secret word is COPPER. The secret",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 32,
+      "completion_tokens": 40,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "completion_tokens exact",
+   "ok": true,
+   "detail": {
+    "text": " COPPER. The secret word is COPPER. The secret word is COPPER. The secret word is COPPER. The secret word is COPPER. The secret word is COPPER. The secret",
+    "tool_calls": [],
+    "finish_reason": "length",
+    "logprobs": null,
+    "prompt_tokens": 32,
+    "completion_tokens": 40,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "draft_accepted <= draft_tokens",
+   "ok": true,
+   "detail": {
+    "text": " COPPER. The secret word is COPPER. The secret word is COPPER. The secret word is COPPER. The secret word is COPPER. The secret word is COPPER. The secret",
+    "tool_calls": [],
+    "finish_reason": "length",
+    "logprobs": null,
+    "prompt_tokens": 32,
+    "completion_tokens": 40,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  {
+   "name": "mtp drafted in parallel lane",
+   "ok": true,
+   "detail": {
+    "per_request": [
+     {
+      "completion_tokens": 40,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     },
+     {
+      "completion_tokens": 40,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     },
+     {
+      "completion_tokens": 40,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     },
+     {
+      "completion_tokens": 40,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ],
+    "drafted": 0,
+    "accepted": 0
+   }
+  },
+  {
+   "name": "runtime totals carry draft counters",
+   "ok": true,
+   "detail": {
+    "aborted": 0,
+    "completed": 12,
+    "completion_tokens": 256,
+    "decode_calls": 102,
+    "draft_accepted": 0,
+    "draft_tokens": 0,
+    "failed": 0,
+    "peak_live": 4,
+    "prompt_tokens": 408,
+    "rejected_context": 0,
+    "rejected_unsupported": 0,
+    "reused_tokens": 148,
+    "submitted": 12
+   }
+  },
+  {
+   "name": "input_tokens ok",
+   "ok": true,
+   "detail": {
+    "input_tokens": 22,
+    "object": "response.input_tokens"
+   }
+  },
+  {
+   "name": "admission exact fit",
+   "ok": true,
+   "detail": {
+    "input_tokens": 22,
+    "max_tokens": 4074,
+    "reserve": 4096,
+    "n_ctx": 4096,
+    "admissible": true,
+    "lane": "parallel"
+   }
+  },
+  {
+   "name": "chat exact fit admitted",
+   "ok": true,
+   "detail": {
+    "id": "chatcmpl-A184684",
+    "object": "chat.completion",
+    "created": 1791030265,
+    "model": "koboldcpp/Qwen_Qwen3-0.6B-Q4_K_M",
+    "usage": {
+     "prompt_tokens": 22,
+     "completion_tokens": 2,
+     "total_tokens": 24
+    },
+    "timings": {
+     "prompt_n": 22,
+     "predicted_n": 2,
+     "draft_n": 0,
+     "draft_n_accepted": 0
+    },
+    "choices": [
+     {
+      "index": 0,
+      "message": {
+       "role": "assistant",
+       "content": "<think>",
+       "tool_calls": []
+      },
+      "finish_reason": "stop",
+      "logprobs": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "chat usage.prompt_tokens == input_tokens",
+   "ok": true,
+   "detail": {
+    "usage": {
+     "prompt_tokens": 22,
+     "completion_tokens": 2,
+     "total_tokens": 24
+    },
+    "input_tokens": 22
+   }
+  },
+  {
+   "name": "chat one-over rejected",
+   "ok": true,
+   "detail": {
+    "error": {
+     "code": 400,
+     "message": "request (22 prompt tokens + 4075 completion tokens) exceeds the available context size (4096 tokens)",
+     "type": "exceed_context_size_error",
+     "n_prompt_tokens": 22,
+     "n_ctx": 4096
+    }
+   }
+  },
+  {
+   "name": "streaming overflow rejected before SSE",
+   "ok": true,
+   "detail": {
+    "error": {
+     "code": 400,
+     "message": "request (22 prompt tokens + 4075 completion tokens) exceeds the available context size (4096 tokens)",
+     "type": "exceed_context_size_error",
+     "n_prompt_tokens": 22,
+     "n_ctx": 4096
+    }
+   }
+  },
+  {
+   "name": "long prompt rejected",
+   "ok": true,
+   "detail": {
+    "error": {
+     "code": 400,
+     "message": "request (5001 prompt tokens + 8 completion tokens) exceeds the available context size (4096 tokens)",
+     "type": "exceed_context_size_error",
+     "n_prompt_tokens": 5001,
+     "n_ctx": 4096
+    }
+   }
+  },
+  {
+   "name": "prompt fits but completion does not -> rejected",
+   "ok": true,
+   "detail": {
+    "error": {
+     "code": 400,
+     "message": "request (3001 prompt tokens + 2000 completion tokens) exceeds the available context size (4096 tokens)",
+     "type": "exceed_context_size_error",
+     "n_prompt_tokens": 3001,
+     "n_ctx": 4096
+    }
+   }
+  },
+  {
+   "name": "prompt + small completion admitted",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 3001,
+      "completion_tokens": 64,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "grammar request constrained",
+   "ok": true,
+   "detail": "yes"
+  },
+  {
+   "name": "neighbour unaffected by grammar",
+   "ok": true,
+   "detail": " COPPER. The secret word is COP"
+  },
+  {
+   "name": "dry/xtc and mirostat requests ok",
+   "ok": true,
+   "detail": [
+    " 1) an apple, 2) an orange, 3) a banana. Explain why each of these fruits",
+    " four five six seven eight nine ten thousand one hundred twenty three hundred forty two thousand"
+   ]
+  },
+  {
+   "name": "multimodal rejected explicitly",
+   "ok": true,
+   "detail": {
+    "error": {
+     "code": 400,
+     "message": "multimodal (image/audio) input is served by the serial lane only",
+     "type": "not_supported_error"
+    }
+   }
+  },
+  {
+   "name": "phrase ban rejected explicitly",
+   "ok": true,
+   "detail": {
+    "error": {
+     "code": 400,
+     "message": "phrase bans (antislop backtracking) are served by the serial lane only",
+     "type": "not_supported_error"
+    }
+   }
+  },
+  {
+   "name": "abort targeted A",
+   "ok": true,
+   "detail": {
+    "success": "true",
+    "done": "true"
+   }
+  },
+  {
+   "name": "A stopped early",
+   "ok": true,
+   "detail": {
+    "abort_response": {
+     "success": "true",
+     "done": "true"
+    },
+    "a_completion": 8,
+    "b_completion": 1200,
+    "aborted_before": 0,
+    "aborted_after": 1
+   }
+  },
+  {
+   "name": "B unaffected",
+   "ok": true,
+   "detail": {
+    "abort_response": {
+     "success": "true",
+     "done": "true"
+    },
+    "a_completion": 8,
+    "b_completion": 1200,
+    "aborted_before": 0,
+    "aborted_after": 1
+   }
+  },
+  {
+   "name": "exactly one abort counted",
+   "ok": true,
+   "detail": {
+    "abort_response": {
+     "success": "true",
+     "done": "true"
+    },
+    "a_completion": 8,
+    "b_completion": 1200,
+    "aborted_before": 0,
+    "aborted_after": 1
+   }
+  },
+  {
+   "name": "slots endpoint",
+   "ok": true,
+   "detail": [
+    {
+     "cached_tokens": 20,
+     "id": 0,
+     "id_task": -1,
+     "is_processing": false,
+     "kv_cells": 20,
+     "n_ctx": 4352,
+     "seq_id": 1,
+     "state": "idle"
+    },
+    {
+     "cached_tokens": 27,
+     "id": 1,
+     "id_task": -1,
+     "is_processing": false,
+     "kv_cells": 27,
+     "n_ctx": 4352,
+     "seq_id": 2,
+     "state": "idle"
+    },
+    {
+     "cached_tokens": 0,
+     "id": 2,
+     "id_task": -1,
+     "is_processing": false,
+     "kv_cells": 0,
+     "n_ctx": 4352,
+     "seq_id": 3,
+     "state": "idle"
+    },
+    {
+     "cached_tokens": 1209,
+     "id": 3,
+     "id_task": -1,
+     "is_processing": false,
+     "kv_cells": 1209,
+     "n_ctx": 4352,
+     "seq_id": 4,
+     "state": "idle"
+    }
+   ]
+  },
+  {
+   "name": "phrase ban routed to serial lane",
+   "ok": true,
+   "detail": {
+    "results": [
+     {
+      "text": " a 5-letter word. The first",
+      "tool_calls": [],
+      "finish_reason": "length",
+      "logprobs": null,
+      "prompt_tokens": 12,
+      "completion_tokens": 8,
+      "draft_tokens": 0,
+      "draft_accepted": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "routing logged",
+   "ok": true,
+   "detail": "log"
+  },
+  {
+   "name": "parallel lane still serves",
+   "ok": true,
+   "detail": [
+    [
+     200,
+     {
+      "results": [
+       {
+        "text": " ZEBRA. The secret word is",
+        "tool_calls": [],
+        "finish_reason": "length",
+        "logprobs": null,
+        "prompt_tokens": 36,
+        "completion_tokens": 8,
+        "draft_tokens": 0,
+        "draft_accepted": 0
+       }
+      ]
+     }
+    ],
+    [
+     200,
+     {
+      "results": [
+       {
+        "text": " MANGO. The secret word is M",
+        "tool_calls": [],
+        "finish_reason": "length",
+        "logprobs": null,
+        "prompt_tokens": 32,
+        "completion_tokens": 8,
+        "draft_tokens": 0,
+        "draft_accepted": 0
+       }
+      ]
+     }
+    ]
+   ]
+  },
+  {
+   "name": "prefix reuse requests ok",
+   "ok": true,
+   "detail": {
+    "fastforward": true,
+    "target_seq_rm": "part",
+    "prompt_tokens": 607,
+    "reused_second": 601,
+    "same_prompt_identical": true
+   }
+  },
+  {
+   "name": "prefix reused for shared prefix",
+   "ok": true,
+   "detail": {
+    "fastforward": true,
+    "target_seq_rm": "part",
+    "prompt_tokens": 607,
+    "reused_second": 601,
+    "same_prompt_identical": true
+   }
+  },
+  {
+   "name": "reused prefix gives identical greedy output",
+   "ok": true,
+   "detail": {
+    "fastforward": true,
+    "target_seq_rm": "part",
+    "prompt_tokens": 607,
+    "reused_second": 601,
+    "same_prompt_identical": true
+   }
+  }
+ ],
+ "startup_rejections": {
+  "no_noshift": {
+   "exit": 2,
+   "message": "--parallelrequests 2 cannot be combined with: context shifting (add --noshift: overflowing parallel requests are rejected, not shifted). Use --parallelrequests 1 for these serial features."
+  },
+  "smartcontext": {
+   "exit": 2,
+   "message": "--parallelrequests 2 cannot be combined with: --smartcontext. Use --parallelrequests 1 for these serial features."
+  },
+  "rope_conflict": {
+   "exit": 2,
+   "message": "--ropescaling cannot be combined with --overridenativecontext (both define the RoPE adjustment)."
+  }
+ },
+ "parallel": {
+  "load_seconds": 23.23,
+  "runtime_at_start": {
+   "context": {
+    "allocated_cells": 4352,
+    "capacity_status": "allocated",
+    "flash_attn": true,
+    "kv_bytes_draft": 0,
+    "kv_bytes_target": 499122176,
+    "kv_type_k": "f16",
+    "kv_type_v": "f16",
+    "n_ctx_seq": 4352,
+    "n_ctx_train": 32768,
+    "n_seq_max": 5,
+    "position_coverage": 32768,
+    "quality_status": "within trained context; long-context quality not verified by this runtime",
+    "quality_verified": false,
+    "requested_ctx": 4096,
+    "rope_freq_base": 1000000.0,
+    "rope_freq_base_train": 1000000.0,
+    "rope_freq_scale": 1.0,
+    "rope_scaling": "none",
+    "yarn_attn_factor": -1.0,
+    "yarn_beta_fast": -1.0,
+    "yarn_beta_slow": -1.0,
+    "yarn_ext_factor": -1.0,
+    "yarn_orig_ctx": 32768
+   },
+   "mtp": {
+    "active": false,
+    "checkpoint_rollback": false,
+    "n_draft_max": 0,
+    "n_rs_seq": 0,
+    "parallel_lane": false,
+    "requested": false,
+    "serial_lane": false,
+    "speculative_type": "none",
+    "status": "not requested"
+   },
+   "parallel": {
+    "cached_cells": 0,
+    "enabled": true,
+    "fastforward": true,
+    "live": 0,
+    "n_ctx_seq": 4352,
+    "n_seq_max": 5,
+    "pool_cells": 4352,
+    "reserved_cells": 0,
+    "serial_lane_active": false,
+    "serial_lane_waiting": 0,
+    "slot_list": [
+     {
+      "cached_tokens": 0,
+      "id": 0,
+      "id_task": -1,
+      "is_processing": false,
+      "kv_cells": 0,
+      "n_ctx": 4352,
+      "seq_id": 1,
+      "state": "idle"
+     },
+     {
+      "cached_tokens": 0,
+      "id": 1,
+      "id_task": -1,
+      "is_processing": false,
+      "kv_cells": 0,
+      "n_ctx": 4352,
+      "seq_id": 2,
+      "state": "idle"
+     },
+     {
+      "cached_tokens": 0,
+      "id": 2,
+      "id_task": -1,
+      "is_processing": false,
+      "kv_cells": 0,
+      "n_ctx": 4352,
+      "seq_id": 3,
+      "state": "idle"
+     },
+     {
+      "cached_tokens": 0,
+      "id": 3,
+      "id_task": -1,
+      "is_processing": false,
+      "kv_cells": 0,
+      "n_ctx": 4352,
+      "seq_id": 4,
+      "state": "idle"
+     }
+    ],
+    "slots": 4,
+    "target_seq_rm": "part",
+    "totals": {
+     "aborted": 0,
+     "completed": 0,
+     "completion_tokens": 0,
+     "decode_calls": 0,
+     "draft_accepted": 0,
+     "draft_tokens": 0,
+     "failed": 0,
+     "peak_live": 0,
+     "prompt_tokens": 0,
+     "rejected_context": 0,
+     "rejected_unsupported": 0,
+     "reused_tokens": 0,
+     "submitted": 0
+    },
+    "waiting": 0
+   },
+   "serial_last": {
+    "draft_accepted": 0,
+    "draft_failed": 0,
+    "draft_tokens": 0
+   }
+  },
+  "isolation": {
+   "ZEBRA": {
+    "text": " ZEBRA. The secret word is ZEBRA.",
+    "solo_text": " ZEBRA. The secret word is ZEBRA.",
+    "identical_to_solo": true,
+    "prompt_tokens": 36,
+    "completion_tokens": 12,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   },
+   "MANGO": {
+    "text": " MANGO. The secret word is MANGO. The secret",
+    "solo_text": " MANGO. The secret word is MANGO. The secret",
+    "identical_to_solo": true,
+    "prompt_tokens": 32,
+    "completion_tokens": 12,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   },
+   "VIOLET": {
+    "text": " VIOLET. The secret word is VIOLET.",
+    "solo_text": " VIOLET. The secret word is VIOLET.",
+    "identical_to_solo": true,
+    "prompt_tokens": 36,
+    "completion_tokens": 12,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   },
+   "COPPER": {
+    "text": " COPPER. The secret word is COPPER. The secret",
+    "solo_text": " COPPER. The secret word is COPPER. The secret",
+    "identical_to_solo": true,
+    "prompt_tokens": 32,
+    "completion_tokens": 12,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   }
+  },
+  "identical_to_solo": 4,
+  "counters": {
+   "per_request": [
+    {
+     "completion_tokens": 40,
+     "draft_tokens": 0,
+     "draft_accepted": 0
+    },
+    {
+     "completion_tokens": 40,
+     "draft_tokens": 0,
+     "draft_accepted": 0
+    },
+    {
+     "completion_tokens": 40,
+     "draft_tokens": 0,
+     "draft_accepted": 0
+    },
+    {
+     "completion_tokens": 40,
+     "draft_tokens": 0,
+     "draft_accepted": 0
+    }
+   ],
+   "drafted": 0,
+   "accepted": 0
+  },
+  "admission": {
+   "input_tokens": 22,
+   "exact_fit_usage": {
+    "prompt_tokens": 22,
+    "completion_tokens": 2,
+    "total_tokens": 24
+   },
+   "one_over": {
+    "error": {
+     "code": 400,
+     "message": "request (22 prompt tokens + 4075 completion tokens) exceeds the available context size (4096 tokens)",
+     "type": "exceed_context_size_error",
+     "n_prompt_tokens": 22,
+     "n_ctx": 4096
+    }
+   },
+   "stream_one_over_status": 400
+  },
+  "overflow": {
+   "long": {
+    "error": {
+     "code": 400,
+     "message": "request (5001 prompt tokens + 8 completion tokens) exceeds the available context size (4096 tokens)",
+     "type": "exceed_context_size_error",
+     "n_prompt_tokens": 5001,
+     "n_ctx": 4096
+    }
+   },
+   "completion_overflow": {
+    "error": {
+     "code": 400,
+     "message": "request (3001 prompt tokens + 2000 completion tokens) exceeds the available context size (4096 tokens)",
+     "type": "exceed_context_size_error",
+     "n_prompt_tokens": 3001,
+     "n_ctx": 4096
+    }
+   },
+   "admitted_prompt_tokens": 3001
+  },
+  "samplers": [
+   "yes",
+   " COPPER. The secret word is COP",
+   " 1) an apple, 2) an orange, 3) a banana. Explain why each of these fruits",
+   " four five six seven eight nine ten thousand one hundred twenty three hundred forty two thousand"
+  ],
+  "unsupported": {
+   "error": {
+    "code": 400,
+    "message": "phrase bans (antislop backtracking) are served by the serial lane only",
+    "type": "not_supported_error"
+   }
+  },
+  "cancellation": {
+   "abort_response": {
+    "success": "true",
+    "done": "true"
+   },
+   "a_completion": 8,
+   "b_completion": 1200,
+   "aborted_before": 0,
+   "aborted_after": 1
+  },
+  "slots": [
+   {
+    "cached_tokens": 20,
+    "id": 0,
+    "id_task": -1,
+    "is_processing": false,
+    "kv_cells": 20,
+    "n_ctx": 4352,
+    "seq_id": 1,
+    "state": "idle"
+   },
+   {
+    "cached_tokens": 27,
+    "id": 1,
+    "id_task": -1,
+    "is_processing": false,
+    "kv_cells": 27,
+    "n_ctx": 4352,
+    "seq_id": 2,
+    "state": "idle"
+   },
+   {
+    "cached_tokens": 0,
+    "id": 2,
+    "id_task": -1,
+    "is_processing": false,
+    "kv_cells": 0,
+    "n_ctx": 4352,
+    "seq_id": 3,
+    "state": "idle"
+   },
+   {
+    "cached_tokens": 1209,
+    "id": 3,
+    "id_task": -1,
+    "is_processing": false,
+    "kv_cells": 1209,
+    "n_ctx": 4352,
+    "seq_id": 4,
+    "state": "idle"
+   }
+  ],
+  "runtime_at_end": {
+   "context": {
+    "allocated_cells": 4352,
+    "capacity_status": "allocated",
+    "flash_attn": true,
+    "kv_bytes_draft": 0,
+    "kv_bytes_target": 499122176,
+    "kv_type_k": "f16",
+    "kv_type_v": "f16",
+    "n_ctx_seq": 4352,
+    "n_ctx_train": 32768,
+    "n_seq_max": 5,
+    "position_coverage": 32768,
+    "quality_status": "within trained context; long-context quality not verified by this runtime",
+    "quality_verified": false,
+    "requested_ctx": 4096,
+    "rope_freq_base": 1000000.0,
+    "rope_freq_base_train": 1000000.0,
+    "rope_freq_scale": 1.0,
+    "rope_scaling": "none",
+    "yarn_attn_factor": -1.0,
+    "yarn_beta_fast": -1.0,
+    "yarn_beta_slow": -1.0,
+    "yarn_ext_factor": -1.0,
+    "yarn_orig_ctx": 32768
+   },
+   "mtp": {
+    "active": false,
+    "checkpoint_rollback": false,
+    "n_draft_max": 0,
+    "n_rs_seq": 0,
+    "parallel_lane": false,
+    "requested": false,
+    "serial_lane": false,
+    "speculative_type": "none",
+    "status": "not requested"
+   },
+   "parallel": {
+    "cached_cells": 1256,
+    "enabled": true,
+    "fastforward": true,
+    "live": 0,
+    "n_ctx_seq": 4352,
+    "n_seq_max": 5,
+    "pool_cells": 4352,
+    "reserved_cells": 0,
+    "serial_lane_active": false,
+    "serial_lane_waiting": 0,
+    "slot_list": [
+     {
+      "cached_tokens": 20,
+      "id": 0,
+      "id_task": -1,
+      "is_processing": false,
+      "kv_cells": 20,
+      "n_ctx": 4352,
+      "seq_id": 1,
+      "state": "idle"
+     },
+     {
+      "cached_tokens": 27,
+      "id": 1,
+      "id_task": -1,
+      "is_processing": false,
+      "kv_cells": 27,
+      "n_ctx": 4352,
+      "seq_id": 2,
+      "state": "idle"
+     },
+     {
+      "cached_tokens": 0,
+      "id": 2,
+      "id_task": -1,
+      "is_processing": false,
+      "kv_cells": 0,
+      "n_ctx": 4352,
+      "seq_id": 3,
+      "state": "idle"
+     },
+     {
+      "cached_tokens": 1209,
+      "id": 3,
+      "id_task": -1,
+      "is_processing": false,
+      "kv_cells": 1209,
+      "n_ctx": 4352,
+      "seq_id": 4,
+      "state": "idle"
+     }
+    ],
+    "slots": 4,
+    "target_seq_rm": "part",
+    "totals": {
+     "aborted": 1,
+     "completed": 19,
+     "completion_tokens": 1580,
+     "decode_calls": 1398,
+     "draft_accepted": 0,
+     "draft_tokens": 0,
+     "failed": 0,
+     "peak_live": 4,
+     "prompt_tokens": 3499,
+     "rejected_context": 4,
+     "rejected_unsupported": 2,
+     "reused_tokens": 148,
+     "submitted": 20
+    },
+    "waiting": 0
+   },
+   "serial_last": {
+    "draft_accepted": 0,
+    "draft_failed": 0,
+    "draft_tokens": 0
+   }
+  }
+ },
+ "parallelserial": {
+  "serial_text": " a 5-letter word. The first",
+  "parallel": [
+   " ZEBRA. The secret word is",
+   " MANGO. The secret word is M"
+  ]
+ },
+ "prefix_reuse": {
+  "fastforward": true,
+  "target_seq_rm": "part",
+  "prompt_tokens": 607,
+  "reused_second": 601,
+  "same_prompt_identical": true
+ },
+ "failures": []
+}
