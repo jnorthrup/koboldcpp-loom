@@ -405,6 +405,41 @@ def test_streaming():
         EVIDENCE["streaming"] = ev
 
 
+def test_mtp_row_budget():
+    """Review bug: 8 generating sequences x (1 + 3 drafts) exceeded a 16-row batch and aborted the server.
+    Drafts must be bounded by the batch's row budget. Also checks logprobs match emitted tokens when a
+    stop string cuts a verified chunk short."""
+    if not MODEL or not EXPECT_MTP:
+        return
+    srv = Server("mtp_rows", ["--parallelrequests", "8", "--noshift", "--usemtp", "--draftamount", "3",
+                              "--batchsize", "16", "--multiuser", "16"], ctx=8192).start()
+    ev = {}
+    try:
+        res = run_concurrently([lambda i=i: gen(srv, "Count upward from %d: %d, %d," % (i, i, i + 1), 48, ban_eos_token=True) for i in range(8)])
+        ok = [s for s, _ in res]
+        alive = srv.proc.poll() is None
+        rt = srv.runtime() if alive else {}
+        ev["status"] = ok
+        ev["alive"] = alive
+        ev["totals"] = rt.get("parallel", {}).get("totals")
+        check("8 slots x draft 3 with batch 16: server alive", alive, ev)
+        check("8 slots x draft 3 with batch 16: all ok", all(s == 200 for s in ok), ev)
+        check("8 slots x draft 3 with batch 16: exact counts", all(b["results"][0]["completion_tokens"] == 48 for _, b in res), [b["results"][0]["completion_tokens"] for _, b in res])
+        check("8 slots: drafting still happened", ev["totals"]["draft_tokens"] > 0 and ev["totals"]["peak_live"] >= 4, ev["totals"])
+        # stop string inside a verified chunk: logprob entries must equal emitted tokens
+        lp = []
+        for word in WORDS:
+            st, body = gen(srv, secret_prompt(word), 24, stop_sequence=[" The"], logprobs=True)
+            r = body["results"][0]
+            n_lp = len((r.get("logprobs") or {}).get("content", []))
+            lp.append({"completion_tokens": r["completion_tokens"], "logprob_entries": n_lp, "text": r["text"]})
+            check("logprobs == emitted tokens (%s)" % word, st == 200 and n_lp == r["completion_tokens"], lp[-1])
+        ev["stop_logprobs"] = lp
+    finally:
+        srv.stop()
+        EVIDENCE["mtp_row_budget"] = ev
+
+
 def test_prefix_reuse():
     """Attention-only models: a finished slot keeps its tokens and the next request reuses the shared prefix.
     Hybrid/recurrent models report fastforward=false and are skipped."""
@@ -494,7 +529,7 @@ def main():
         print("KCPP_TEST_MODEL is not set; nothing to run")
         return 0
     failures = []
-    for t in (test_startup_rejections, test_parallel_engine, test_parallelserial_routing, test_streaming, test_prefix_reuse, test_context_profiles):
+    for t in (test_startup_rejections, test_parallel_engine, test_parallelserial_routing, test_streaming, test_mtp_row_budget, test_prefix_reuse, test_context_profiles):
         try:
             t()
             print("PASS", t.__name__)

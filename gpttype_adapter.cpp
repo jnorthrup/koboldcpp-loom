@@ -4026,9 +4026,11 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         kcpp_build_context_profile(llamamodel, llama_ctx_params);
         printf("Starting model warm up, please wait a moment...\n");
 
-        //warmup at least 33 tokens to trigger batch
+        //warmup at least 33 tokens to trigger batch, but never more than n_batch: unmasked MTP NextN
+        //embeddings are sized to n_batch rows, so a larger single decode overflows them
         std::vector<int> tmp;
-        for (int i = 1; i <= 33; ++i) {
+        const int warmup_n = std::max(1, std::min(33, (int) llama_n_batch(llama_ctx_v4)));
+        for (int i = 1; i <= warmup_n; ++i) {
             tmp.push_back(i);
         }
         llama_memory_clear(llama_get_memory(llama_ctx_v4),true);
@@ -5494,6 +5496,19 @@ static void batch_worker_loop()
         bool any_draft = false;
         if(batch_spec_enabled && draft_spec)
         {
+            //row budgets: every generating sequence needs one verify row; drafts share what is left.
+            //the draft context decodes all drafting sequences in one batch, and chained MTP heads
+            //re-add the whole prefix (up to n_max+1 rows per sequence), so reserve n_max+1 there.
+            int n_generating = 0;
+            for(auto * req : live)
+            {
+                if(req->state == BatchState::GENERATING && req->has_pending)
+                {
+                    ++n_generating;
+                }
+            }
+            int verify_budget = std::max(0, batch_cap - n_generating);
+            int draft_rows_budget = draft_ctx ? (int) llama_n_batch(draft_ctx) : batch_cap;
             for(auto * req : live)
             {
                 req->draft.clear();
@@ -5504,10 +5519,14 @@ static void batch_worker_loop()
                 const int remaining = req->max_length - req->n_generated;
                 int n_max = std::min(speculative_chunk_amt, remaining - 1);
                 n_max = std::min(n_max, req->n_ctx_cap - req->n_past - 1);
+                n_max = std::min(n_max, verify_budget);
+                n_max = std::min(n_max, draft_rows_budget - 1);
                 if(n_max <= 0)
                 {
                     continue;
                 }
+                verify_budget -= n_max;
+                draft_rows_budget -= n_max + 1;
                 auto & dp = common_speculative_get_draft_params(draft_spec, batch_slots[req->slot].seq);
                 dp.drafting = true;
                 dp.n_max = n_max;
@@ -5737,6 +5756,12 @@ static void batch_worker_loop()
             {
                 req->pending_token = sampled.back();
                 req->has_pending = true;
+            }
+            else if(oc.n_emitted < (int) sampled.size())
+            {
+                //a stop ended emission inside a verified chunk: drop logprobs of tokens that are not returned
+                const size_t drop = sampled.size() - (size_t) std::max(0, oc.n_emitted);
+                req->top_picks.resize(req->top_picks.size() >= drop ? req->top_picks.size() - drop : 0);
             }
             outcomes.push_back(std::move(oc));
         }
