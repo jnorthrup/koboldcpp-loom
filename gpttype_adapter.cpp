@@ -3102,8 +3102,9 @@ static void kcpp_build_context_profile(const llama_model * model, const llama_co
         freq_scale = 1.0f;
     }
     const int yarn_orig = cparams.yarn_orig_ctx != 0 ? (int) cparams.yarn_orig_ctx : (hp.n_ctx_orig_yarn != 0 ? (int) hp.n_ctx_orig_yarn : n_ctx_train);
-    const char * rst_name = rst == LLAMA_ROPE_SCALING_TYPE_NONE ? "none" : (rst == LLAMA_ROPE_SCALING_TYPE_LINEAR ? "linear" : (rst == LLAMA_ROPE_SCALING_TYPE_YARN ? "yarn" : (rst == LLAMA_ROPE_SCALING_TYPE_LONGROPE ? "longrope" : "unspecified")));
     const bool scaled = (rst == LLAMA_ROPE_SCALING_TYPE_YARN || rst == LLAMA_ROPE_SCALING_TYPE_LINEAR) && freq_scale > 0.0f && freq_scale < 1.0f;
+    //llama.cpp reports "linear" for models without a scaling key; with scale 1.0 nothing is scaled
+    const char * rst_name = (!scaled && rst != LLAMA_ROPE_SCALING_TYPE_LONGROPE) ? "none" : (rst == LLAMA_ROPE_SCALING_TYPE_LINEAR ? "linear" : (rst == LLAMA_ROPE_SCALING_TYPE_YARN ? "yarn" : (rst == LLAMA_ROPE_SCALING_TYPE_LONGROPE ? "longrope" : "unspecified")));
     const int requested = max_context_limit_at_load;
     const size_t kv_tgt = kcpp_ctx_kv_bytes(llama_ctx_v4);
     const size_t kv_dft = kcpp_ctx_kv_bytes(draft_ctx);

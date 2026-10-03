@@ -324,27 +324,51 @@ def test_parallelserial_routing():
 
 
 PROFILE_LINE = re.compile(r"Context profile: .*")
+FILLER = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
+
+
+def passkey_prompt(srv, target_tokens, key):
+    # place the key at 30% depth inside ~target_tokens of filler (exact count via the engine)
+    st, cnt = srv.post("/api/extra/tokencount", {"prompt": FILLER})
+    per = max(1, cnt["value"])
+    reps = max(1, int(target_tokens / per))
+    at = int(reps * 0.3)
+    body = FILLER * at + ("The pass key is %d. Remember it. %d is the pass key. " % (key, key)) + FILLER * (reps - at)
+    return body + "\nWhat is the pass key? The pass key is"
 
 
 def test_context_profiles():
     if not MODEL or os.environ.get("KCPP_TEST_PROFILES", "") != "1":
         return
     profiles = {}
-    for ctx in (131072, 262144, 524288, 1048576):
-        extra = ["--quantkv", "q8_0", "--usemtp", "--draftamount", "2"]
-        if ctx > 262144:
-            extra += ["--ropescaling", "yarn"]
+    plan = [(131072, []), (262144, []), (524288, ["--ropescaling", "yarn"]), (1048576, ["--ropescaling", "yarn"])]
+    probe_depths = [int(x) for x in os.environ.get("KCPP_TEST_PROBE", "4000").split(",") if x]
+    for ctx, rope in plan:
+        extra = ["--quantkv", "q8_0", "--usemtp", "--draftamount", "2", "--noshift"] + rope
         srv = Server("profile_%d" % ctx, extra, ctx=ctx)
         try:
             srv.start(timeout=900)
             rt = srv.runtime()
             st, body = gen(srv, "The capital of France is", 8)
             m = PROFILE_LINE.search(srv.log_text())
+            probes = []
+            for depth in probe_depths:
+                if depth + 64 > ctx:
+                    continue
+                key = 70000 + depth % 9973
+                prompt = passkey_prompt(srv, depth, key)
+                t0 = time.time()
+                pst, pbody = gen(srv, prompt, 8)
+                dt = time.time() - t0
+                txt = pbody["results"][0]["text"] if pst == 200 else str(pbody)
+                probes.append({"target_tokens": depth, "prompt_tokens": pbody["results"][0]["prompt_tokens"] if pst == 200 else None,
+                               "seconds": round(dt, 2), "found": str(key) in txt, "text": txt})
             profiles[ctx] = {"load_seconds": srv.load_seconds, "context": rt["context"], "mtp_active": rt["mtp"]["active"],
                              "generate_ok": st == 200, "sample": body["results"][0]["text"] if st == 200 else body,
-                             "log": m.group(0) if m else ""}
+                             "log": m.group(0) if m else "", "passkey": probes}
             check("profile %d allocated" % ctx, rt["context"]["allocated_cells"] >= ctx and st == 200, profiles[ctx]["context"])
             check("profile %d quality not claimed" % ctx, rt["context"]["quality_verified"] is False, rt["context"]["quality_status"])
+            check("profile %d mtp active" % ctx, rt["mtp"]["active"], rt["mtp"])
         except Exception as e:
             profiles[ctx] = {"error": str(e)}
             check("profile %d" % ctx, False, str(e))

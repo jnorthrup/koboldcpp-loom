@@ -1,0 +1,394 @@
+{
+ "checks": [
+  {
+   "name": "profile 131072 allocated",
+   "ok": true,
+   "detail": {
+    "allocated_cells": 131328,
+    "capacity_status": "allocated",
+    "flash_attn": true,
+    "kv_bytes_draft": 142884864,
+    "kv_bytes_target": 917913600,
+    "kv_type_k": "q8_0",
+    "kv_type_v": "q8_0",
+    "n_ctx_seq": 131328,
+    "n_ctx_train": 262144,
+    "n_seq_max": 1,
+    "position_coverage": 262144,
+    "quality_status": "within trained context; long-context quality not verified by this runtime",
+    "quality_verified": false,
+    "requested_ctx": 131072,
+    "rope_freq_base": 10000000.0,
+    "rope_freq_base_train": 10000000.0,
+    "rope_freq_scale": 1.0,
+    "rope_scaling": "linear",
+    "yarn_attn_factor": -1.0,
+    "yarn_beta_fast": -1.0,
+    "yarn_beta_slow": -1.0,
+    "yarn_ext_factor": -1.0,
+    "yarn_orig_ctx": 262144
+   }
+  },
+  {
+   "name": "profile 131072 quality not claimed",
+   "ok": true,
+   "detail": "within trained context; long-context quality not verified by this runtime"
+  },
+  {
+   "name": "profile 131072 mtp active",
+   "ok": true,
+   "detail": {
+    "active": true,
+    "checkpoint_rollback": false,
+    "n_draft_max": 2,
+    "n_rs_seq": 2,
+    "parallel_lane": false,
+    "requested": true,
+    "serial_lane": true,
+    "speculative_type": "draft-mtp",
+    "status": "active"
+   }
+  },
+  {
+   "name": "profile 262144 allocated",
+   "ok": true,
+   "detail": {
+    "allocated_cells": 262400,
+    "capacity_status": "allocated",
+    "flash_attn": true,
+    "kv_bytes_draft": 285491200,
+    "kv_bytes_target": 1773551616,
+    "kv_type_k": "q8_0",
+    "kv_type_v": "q8_0",
+    "n_ctx_seq": 262400,
+    "n_ctx_train": 262144,
+    "n_seq_max": 1,
+    "position_coverage": 262144,
+    "quality_status": "within trained context; long-context quality not verified by this runtime",
+    "quality_verified": false,
+    "requested_ctx": 262144,
+    "rope_freq_base": 10000000.0,
+    "rope_freq_base_train": 10000000.0,
+    "rope_freq_scale": 1.0,
+    "rope_scaling": "linear",
+    "yarn_attn_factor": -1.0,
+    "yarn_beta_fast": -1.0,
+    "yarn_beta_slow": -1.0,
+    "yarn_ext_factor": -1.0,
+    "yarn_orig_ctx": 262144
+   }
+  },
+  {
+   "name": "profile 262144 quality not claimed",
+   "ok": true,
+   "detail": "within trained context; long-context quality not verified by this runtime"
+  },
+  {
+   "name": "profile 262144 mtp active",
+   "ok": true,
+   "detail": {
+    "active": true,
+    "checkpoint_rollback": false,
+    "n_draft_max": 2,
+    "n_rs_seq": 2,
+    "parallel_lane": false,
+    "requested": true,
+    "serial_lane": true,
+    "speculative_type": "draft-mtp",
+    "status": "active"
+   }
+  },
+  {
+   "name": "profile 524288 allocated",
+   "ok": true,
+   "detail": {
+    "allocated_cells": 524544,
+    "capacity_status": "allocated",
+    "flash_attn": true,
+    "kv_bytes_draft": 570703872,
+    "kv_bytes_target": 3484827648,
+    "kv_type_k": "q8_0",
+    "kv_type_v": "q8_0",
+    "n_ctx_seq": 524544,
+    "n_ctx_train": 262144,
+    "n_seq_max": 1,
+    "position_coverage": 524288,
+    "quality_status": "beyond trained context with YaRN; long-context quality not verified by this runtime",
+    "quality_verified": false,
+    "requested_ctx": 524288,
+    "rope_freq_base": 10000000.0,
+    "rope_freq_base_train": 10000000.0,
+    "rope_freq_scale": 0.5,
+    "rope_scaling": "yarn",
+    "yarn_attn_factor": -1.0,
+    "yarn_beta_fast": -1.0,
+    "yarn_beta_slow": -1.0,
+    "yarn_ext_factor": -1.0,
+    "yarn_orig_ctx": 262144
+   }
+  },
+  {
+   "name": "profile 524288 quality not claimed",
+   "ok": true,
+   "detail": "beyond trained context with YaRN; long-context quality not verified by this runtime"
+  },
+  {
+   "name": "profile 524288 mtp active",
+   "ok": true,
+   "detail": {
+    "active": true,
+    "checkpoint_rollback": false,
+    "n_draft_max": 2,
+    "n_rs_seq": 2,
+    "parallel_lane": false,
+    "requested": true,
+    "serial_lane": true,
+    "speculative_type": "draft-mtp",
+    "status": "active"
+   }
+  },
+  {
+   "name": "profile 1048576 allocated",
+   "ok": true,
+   "detail": {
+    "allocated_cells": 1048832,
+    "capacity_status": "allocated",
+    "flash_attn": true,
+    "kv_bytes_draft": 1141129216,
+    "kv_bytes_target": 6907379712,
+    "kv_type_k": "q8_0",
+    "kv_type_v": "q8_0",
+    "n_ctx_seq": 1048832,
+    "n_ctx_train": 262144,
+    "n_seq_max": 1,
+    "position_coverage": 1048576,
+    "quality_status": "beyond trained context with YaRN; long-context quality not verified by this runtime",
+    "quality_verified": false,
+    "requested_ctx": 1048576,
+    "rope_freq_base": 10000000.0,
+    "rope_freq_base_train": 10000000.0,
+    "rope_freq_scale": 0.25,
+    "rope_scaling": "yarn",
+    "yarn_attn_factor": -1.0,
+    "yarn_beta_fast": -1.0,
+    "yarn_beta_slow": -1.0,
+    "yarn_ext_factor": -1.0,
+    "yarn_orig_ctx": 262144
+   }
+  },
+  {
+   "name": "profile 1048576 quality not claimed",
+   "ok": true,
+   "detail": "beyond trained context with YaRN; long-context quality not verified by this runtime"
+  },
+  {
+   "name": "profile 1048576 mtp active",
+   "ok": true,
+   "detail": {
+    "active": true,
+    "checkpoint_rollback": false,
+    "n_draft_max": 2,
+    "n_rs_seq": 2,
+    "parallel_lane": false,
+    "requested": true,
+    "serial_lane": true,
+    "speculative_type": "draft-mtp",
+    "status": "active"
+   }
+  }
+ ],
+ "profiles": {
+  "131072": {
+   "load_seconds": 2.53,
+   "context": {
+    "allocated_cells": 131328,
+    "capacity_status": "allocated",
+    "flash_attn": true,
+    "kv_bytes_draft": 142884864,
+    "kv_bytes_target": 917913600,
+    "kv_type_k": "q8_0",
+    "kv_type_v": "q8_0",
+    "n_ctx_seq": 131328,
+    "n_ctx_train": 262144,
+    "n_seq_max": 1,
+    "position_coverage": 262144,
+    "quality_status": "within trained context; long-context quality not verified by this runtime",
+    "quality_verified": false,
+    "requested_ctx": 131072,
+    "rope_freq_base": 10000000.0,
+    "rope_freq_base_train": 10000000.0,
+    "rope_freq_scale": 1.0,
+    "rope_scaling": "linear",
+    "yarn_attn_factor": -1.0,
+    "yarn_beta_fast": -1.0,
+    "yarn_beta_slow": -1.0,
+    "yarn_ext_factor": -1.0,
+    "yarn_orig_ctx": 262144
+   },
+   "mtp_active": true,
+   "generate_ok": true,
+   "sample": " Paris.\nThe capital of France is",
+   "log": "Context profile: requested 131072, allocated 131328 cells (131328 per sequence x 1 sequences), trained 262144, rope linear base 10000000.0 scale 1.000000 (yarn orig 262144), KV q8_0/q8_0 target 875.39 MiB, draft 136.27 MiB; within trained context; long-context quality not verified by this runtime",
+   "passkey": [
+    {
+     "target_tokens": 4000,
+     "prompt_tokens": 3708,
+     "seconds": 2.18,
+     "found": true,
+     "text": " 74000. Remember"
+    },
+    {
+     "target_tokens": 32000,
+     "prompt_tokens": 29556,
+     "seconds": 19.73,
+     "found": true,
+     "text": " 72081. Remember"
+    }
+   ]
+  },
+  "262144": {
+   "load_seconds": 2.53,
+   "context": {
+    "allocated_cells": 262400,
+    "capacity_status": "allocated",
+    "flash_attn": true,
+    "kv_bytes_draft": 285491200,
+    "kv_bytes_target": 1773551616,
+    "kv_type_k": "q8_0",
+    "kv_type_v": "q8_0",
+    "n_ctx_seq": 262400,
+    "n_ctx_train": 262144,
+    "n_seq_max": 1,
+    "position_coverage": 262144,
+    "quality_status": "within trained context; long-context quality not verified by this runtime",
+    "quality_verified": false,
+    "requested_ctx": 262144,
+    "rope_freq_base": 10000000.0,
+    "rope_freq_base_train": 10000000.0,
+    "rope_freq_scale": 1.0,
+    "rope_scaling": "linear",
+    "yarn_attn_factor": -1.0,
+    "yarn_beta_fast": -1.0,
+    "yarn_beta_slow": -1.0,
+    "yarn_ext_factor": -1.0,
+    "yarn_orig_ctx": 262144
+   },
+   "mtp_active": true,
+   "generate_ok": true,
+   "sample": " Paris.\nThe capital of France is",
+   "log": "Context profile: requested 262144, allocated 262400 cells (262400 per sequence x 1 sequences), trained 262144, rope linear base 10000000.0 scale 1.000000 (yarn orig 262144), KV q8_0/q8_0 target 1691.39 MiB, draft 272.27 MiB; within trained context; long-context quality not verified by this runtime",
+   "passkey": [
+    {
+     "target_tokens": 4000,
+     "prompt_tokens": 3708,
+     "seconds": 1.9,
+     "found": true,
+     "text": " 74000. Remember"
+    },
+    {
+     "target_tokens": 32000,
+     "prompt_tokens": 29556,
+     "seconds": 19.52,
+     "found": true,
+     "text": " 72081. Remember"
+    }
+   ]
+  },
+  "524288": {
+   "load_seconds": 2.52,
+   "context": {
+    "allocated_cells": 524544,
+    "capacity_status": "allocated",
+    "flash_attn": true,
+    "kv_bytes_draft": 570703872,
+    "kv_bytes_target": 3484827648,
+    "kv_type_k": "q8_0",
+    "kv_type_v": "q8_0",
+    "n_ctx_seq": 524544,
+    "n_ctx_train": 262144,
+    "n_seq_max": 1,
+    "position_coverage": 524288,
+    "quality_status": "beyond trained context with YaRN; long-context quality not verified by this runtime",
+    "quality_verified": false,
+    "requested_ctx": 524288,
+    "rope_freq_base": 10000000.0,
+    "rope_freq_base_train": 10000000.0,
+    "rope_freq_scale": 0.5,
+    "rope_scaling": "yarn",
+    "yarn_attn_factor": -1.0,
+    "yarn_beta_fast": -1.0,
+    "yarn_beta_slow": -1.0,
+    "yarn_ext_factor": -1.0,
+    "yarn_orig_ctx": 262144
+   },
+   "mtp_active": true,
+   "generate_ok": true,
+   "sample": " Paris.\nThe capital of France is",
+   "log": "Context profile: requested 524288, allocated 524544 cells (524544 per sequence x 1 sequences), trained 262144, rope yarn base 10000000.0 scale 0.500000 (yarn orig 262144), KV q8_0/q8_0 target 3323.39 MiB, draft 544.27 MiB; beyond trained context with YaRN; long-context quality not verified by this runtime",
+   "passkey": [
+    {
+     "target_tokens": 4000,
+     "prompt_tokens": 3708,
+     "seconds": 1.88,
+     "found": true,
+     "text": " 74000. Remember"
+    },
+    {
+     "target_tokens": 32000,
+     "prompt_tokens": 29556,
+     "seconds": 19.33,
+     "found": true,
+     "text": " 72081. Remember"
+    }
+   ]
+  },
+  "1048576": {
+   "load_seconds": 3.52,
+   "context": {
+    "allocated_cells": 1048832,
+    "capacity_status": "allocated",
+    "flash_attn": true,
+    "kv_bytes_draft": 1141129216,
+    "kv_bytes_target": 6907379712,
+    "kv_type_k": "q8_0",
+    "kv_type_v": "q8_0",
+    "n_ctx_seq": 1048832,
+    "n_ctx_train": 262144,
+    "n_seq_max": 1,
+    "position_coverage": 1048576,
+    "quality_status": "beyond trained context with YaRN; long-context quality not verified by this runtime",
+    "quality_verified": false,
+    "requested_ctx": 1048576,
+    "rope_freq_base": 10000000.0,
+    "rope_freq_base_train": 10000000.0,
+    "rope_freq_scale": 0.25,
+    "rope_scaling": "yarn",
+    "yarn_attn_factor": -1.0,
+    "yarn_beta_fast": -1.0,
+    "yarn_beta_slow": -1.0,
+    "yarn_ext_factor": -1.0,
+    "yarn_orig_ctx": 262144
+   },
+   "mtp_active": true,
+   "generate_ok": true,
+   "sample": " located in the region of the country.",
+   "log": "Context profile: requested 1048576, allocated 1048832 cells (1048832 per sequence x 1 sequences), trained 262144, rope yarn base 10000000.0 scale 0.250000 (yarn orig 262144), KV q8_0/q8_0 target 6587.39 MiB, draft 1088.27 MiB; beyond trained context with YaRN; long-context quality not verified by this runtime",
+   "passkey": [
+    {
+     "target_tokens": 4000,
+     "prompt_tokens": 3708,
+     "seconds": 1.93,
+     "found": true,
+     "text": " 74000. Remember"
+    },
+    {
+     "target_tokens": 32000,
+     "prompt_tokens": 29556,
+     "seconds": 19.77,
+     "found": true,
+     "text": " 72081. Remember"
+    }
+   ]
+  }
+ }
+}
