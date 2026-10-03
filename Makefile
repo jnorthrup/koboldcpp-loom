@@ -643,7 +643,7 @@ gguf.o: ggml/src/gguf.cpp ggml/include/gguf.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 kcpputils.o: otherarch/utils.cpp otherarch/utils.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
-kcppllmutils.o: otherarch/llmutils.cpp otherarch/llmutils.h
+kcppllmutils.o: otherarch/llmutils.cpp otherarch/llmutils.h common/common.h include/llama.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 mtmdaudio.o: tools/mtmd/mtmd-audio.cpp tools/mtmd/mtmd-audio.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -777,7 +777,7 @@ whispercpp_default.o: otherarch/whispercpp/whisper_adapter.cpp otherarch/whisper
 tts_default.o: otherarch/tts_adapter.cpp otherarch/ttscpp/src/ttscpp.cpp otherarch/ttscpp/src/ttstokenizer.cpp otherarch/ttscpp/src/ttssampler.cpp otherarch/ttscpp/src/parler_model.cpp otherarch/ttscpp/src/dac_model.cpp otherarch/ttscpp/src/ttsutil.cpp otherarch/ttscpp/src/ttsargs.cpp otherarch/ttscpp/src/ttst5_encoder_model.cpp otherarch/ttscpp/src/phonemizer.cpp otherarch/ttscpp/src/tts_model.cpp otherarch/ttscpp/src/kokoro_model.cpp otherarch/ttscpp/src/dia_model.cpp otherarch/ttscpp/src/orpheus_model.cpp otherarch/ttscpp/src/snac_model.cpp otherarch/ttscpp/src/general_neural_audio_codec.cpp $(TTS_PARROT_DEPS)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-embeddings_default.o: otherarch/embeddings_adapter.cpp
+embeddings_default.o: otherarch/embeddings_adapter.cpp common/common.h include/llama.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 music_default.o: otherarch/acestep/music_adapter.cpp
@@ -785,6 +785,8 @@ music_default.o: otherarch/acestep/music_adapter.cpp
 
 # idiotic "for easier compilation"
 GPTTYPE_ADAPTER = gpttype_adapter.cpp kcpp_backend.h model_adapter.h otherarch/otherarch.h include/llama.h otherarch/llama_v2.cpp otherarch/llama_v3.cpp otherarch/gptj_v1.cpp otherarch/gptj_v2.cpp otherarch/gptj_v3.cpp otherarch/gpt2_v1.cpp otherarch/gpt2_v2.cpp otherarch/gpt2_v3.cpp otherarch/rwkv_v2.cpp otherarch/rwkv_v3.cpp otherarch/neox_v2.cpp otherarch/neox_v3.cpp otherarch/mpt_v3.cpp
+# headers the adapter compiles against: upstream backports change these, so they must trigger rebuilds
+GPTTYPE_ADAPTER += common/common.h common/speculative.h common/sampling.h tools/mtmd/mtmd.h tools/mtmd/mtmd-helper.h include/llama-cpp.h src/llama-context.h src/llama-batch.h src/llama-grammar.h
 gpttype_adapter_default.o: $(GPTTYPE_ADAPTER)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
