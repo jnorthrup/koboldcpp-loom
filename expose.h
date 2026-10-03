@@ -93,6 +93,12 @@ struct load_model_inputs
     const int rpc_mode = 0; //0=disabled, 1=connect, 2=host
     const char * rpc_targets = nullptr;
     const bool loomcache = false; //LOOM tree cache: smartcache slots act as prefix-tree branches
+    const int rope_scaling_type = -1; //-1 = model/kobold automatic, else llama_rope_scaling_type (0 none, 1 linear, 2 yarn)
+    const int yarn_orig_ctx = 0; //0 = model value
+    const float yarn_ext_factor = -1.0f; //negative = model/derived value
+    const float yarn_attn_factor = -1.0f;
+    const float yarn_beta_fast = -1.0f;
+    const float yarn_beta_slow = -1.0f;
 };
 struct generation_inputs
 {
@@ -160,6 +166,17 @@ struct generation_outputs
     int prompt_tokens = 0;
     int completion_tokens = 0;
     const char * text; //response will now be stored in c++ allocated memory
+    int draft_tokens = 0; //speculative tokens drafted and sent for verification
+    int draft_accepted = 0; //drafted tokens accepted by the target model
+};
+struct batch_submit_outputs
+{
+    int request_id = -1;
+    int error_code = 0; //0 ok, 1 parallel lane disabled, 2 needs a serial-only feature, 3 exceeds context, 4 invalid request
+    int n_prompt_tokens = 0; //exact engine tokens (memory + prompt) for this request
+    int n_ctx = 0; //context cap the request was admitted against
+    int reserve = 0; //prompt + completion reservation
+    const char * message = nullptr;
 };
 struct token_count_outputs
 {
@@ -413,10 +430,13 @@ extern int total_tts_gens;
 extern int total_transcribe_gens;
 extern int last_draft_success;
 extern int last_draft_failed;
+extern int last_draft_total;
 extern stop_reason last_stop_reason;
 
 bool gpttype_batch_generate_enabled();
-int gpttype_batch_generate_submit(const generation_inputs inputs);
+batch_submit_outputs gpttype_batch_generate_submit(const generation_inputs inputs);
+batch_submit_outputs gpttype_batch_count_prompt(const generation_inputs inputs);
+const char * gpttype_batch_generate_error(int request_id);
 bool gpttype_batch_generate_has_finished(int request_id);
 int gpttype_batch_generate_stream_count(int request_id);
 const char * gpttype_batch_generate_new_token(int request_id, int idx);

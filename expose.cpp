@@ -286,8 +286,32 @@ extern "C"
     bool batch_generate_enabled() {
         return gpttype_batch_generate_enabled();
     }
-    int batch_generate_submit(const generation_inputs inputs) {
-        return gpttype_batch_generate_submit(inputs);
+    batch_submit_outputs batch_generate_submit(const generation_inputs inputs) {
+        try {
+            return gpttype_batch_generate_submit(inputs);
+        } catch (const std::exception & e) {
+            static thread_local std::string msg;
+            msg = std::string("parallel submit failed: ") + e.what();
+            batch_submit_outputs out;
+            out.error_code = 4;
+            out.message = msg.c_str();
+            return out;
+        }
+    }
+    batch_submit_outputs batch_count_prompt(const generation_inputs inputs) {
+        try {
+            return gpttype_batch_count_prompt(inputs);
+        } catch (const std::exception & e) {
+            static thread_local std::string msg;
+            msg = std::string("token count failed: ") + e.what();
+            batch_submit_outputs out;
+            out.error_code = 4;
+            out.message = msg.c_str();
+            return out;
+        }
+    }
+    const char * batch_generate_error(int request_id) {
+        return gpttype_batch_generate_error(request_id);
     }
     bool batch_generate_has_finished(int request_id) {
         return gpttype_batch_generate_has_finished(request_id);
@@ -341,6 +365,10 @@ extern "C"
      int get_last_draft_failed()
     {
         return last_draft_failed;
+    }
+    int get_last_draft_total()
+    {
+        return last_draft_total;
     }
     int get_total_gens() {
         return total_gens;
@@ -444,6 +472,41 @@ extern "C"
         output.count = last_logprob_items.size();
         output.logprob_items = last_logprob_items.data();
         return output;
+    }
+
+    // per-request logprobs for the parallel lane; storage is per calling thread
+    static thread_local std::vector<logprob_item> batch_logprob_items;
+    static thread_local std::vector<TopPicksData> batch_logprob_toppicks;
+    last_logprobs_outputs batch_last_logprobs(int request_id)
+    {
+        last_logprobs_outputs output;
+        batch_logprob_items.clear();
+        batch_logprob_toppicks = gpttype_batch_generate_top_picks(request_id);
+        for(int i=0;i<batch_logprob_toppicks.size();++i)
+        {
+            logprob_item itm;
+            itm.option_count = batch_logprob_toppicks[i].tokenid.size();
+            itm.selected_token = batch_logprob_toppicks[i].selected_token.c_str();
+            itm.selected_logprob = batch_logprob_toppicks[i].selected_logprob;
+            itm.selected_token_id = batch_logprob_toppicks[i].selected_tokenid;
+            itm.logprobs = batch_logprob_toppicks[i].logprobs.data();
+            for(int j=0;j<itm.option_count && j<logprobs_max;++j)
+            {
+                itm.tokens[j] = batch_logprob_toppicks[i].tokens[j].c_str();
+                itm.token_ids[j] = batch_logprob_toppicks[i].tokenid[j];
+            }
+            batch_logprob_items.push_back(itm);
+        }
+        output.count = batch_logprob_items.size();
+        output.logprob_items = batch_logprob_items.data();
+        return output;
+    }
+
+    const char * get_runtime_status()
+    {
+        static thread_local std::string status;
+        status = gpttype_runtime_status();
+        return status.c_str();
     }
 
     size_t calc_new_state_kv() // returns how much memory a new savestate will cost

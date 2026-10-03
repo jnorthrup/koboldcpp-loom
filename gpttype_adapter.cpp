@@ -91,6 +91,25 @@ int last_draft_failed = 0;
 stop_reason last_stop_reason = stop_reason::INVALID;
 std::vector<std::string> generated_tokens;
 static int continuous_batching_slots = 0;
+static bool batch_fastforward = false; //parallel slots reuse cached prompt prefixes (target memory supports partial seq_rm)
+static bool batch_spec_enabled = false; //MTP drafting also runs in the parallel lane, one speculative state per sequence
+static bool batch_spec_dft_rollback = false; //draft context owns KV that is trimmed before each target decode
+static common_context_seq_rm_type batch_tgt_seq_rm = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+static bool mtp_requested = false;
+static std::string mtp_status_reason = "not requested";
+static nlohmann::json kcpp_context_profile = nlohmann::json::object();
+int last_draft_total = 0;
+static void batch_init_slots(int slots);
+static const char * kcpp_seq_rm_name(common_context_seq_rm_type t)
+{
+    switch(t)
+    {
+        case COMMON_CONTEXT_SEQ_RM_TYPE_PART: return "part";
+        case COMMON_CONTEXT_SEQ_RM_TYPE_FULL: return "full";
+        case COMMON_CONTEXT_SEQ_RM_TYPE_RS: return "rs";
+        default: return "no";
+    }
+}
 
 llama_grammar *  grammar = nullptr; //currently used grammar
 llama_grammar_parser parsed_grammar;
@@ -918,7 +937,7 @@ static bool speculative_state_setup(llama_context * main_ctx, const llama_contex
 
     try
     {
-        draft_spec = common_speculative_init(spec_params, 1);
+        draft_spec = common_speculative_init(spec_params, std::max<uint32_t>(1, llama_n_seq_max(main_ctx))); //one draft state per sequence (serial lane = seq 0)
     }
     catch(const std::exception & e)
     {
@@ -950,6 +969,7 @@ static void mtp_decoding_setup(llama_model * main_model, llama_context * main_ct
     if(main_model == nullptr || main_model->hparams.n_layer_nextn <= 0)
     {
         printf("Warning: --usemtp was enabled, but this model does not expose built-in MTP layers. MTP will not be used.\n");
+        mtp_status_reason = "model has no built-in MTP layers";
         draft_is_mtp = false;
         return;
     }
@@ -965,12 +985,21 @@ static void mtp_decoding_setup(llama_model * main_model, llama_context * main_ct
     if(draft_ctx == nullptr)
     {
         printf("Error: failed to create built-in MTP context. MTP will not be used!\n");
+        mtp_status_reason = "failed to create MTP context";
         draft_is_mtp = false;
         return;
     }
 
     draft_is_mtp = true;
-    speculative_state_setup(main_ctx, mtp_ctx_params, -1, COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    if(speculative_state_setup(main_ctx, mtp_ctx_params, -1, COMMON_SPECULATIVE_TYPE_DRAFT_MTP))
+    {
+        mtp_status_reason = "active";
+        printf("\nBuilt-in MTP active: draft-mtp, up to %d draft tokens, %u sequence states.\n", speculative_chunk_amt, llama_n_seq_max(main_ctx));
+    }
+    else
+    {
+        mtp_status_reason = "speculative state initialization failed";
+    }
 }
 
 //loads a model for speculative decoding.
@@ -1301,6 +1330,7 @@ void sample_top_k(llama_token_data_array * cur_p, int32_t k) {
     cur_p->size = k;
 }
 
+static thread_local std::vector<TopPicksData> * top_picks_redirect = nullptr; //parallel lane: per-request logprob history
 llama_token sample_token(llama_token_data_array * candidates, std::mt19937 & rng)
 {
     sample_softmax(candidates);
@@ -1343,6 +1373,11 @@ llama_token sample_token(llama_token_data_array * candidates, std::mt19937 & rng
         newpick.tokenid.push_back(candidates->data[i].id);
     }
 
+    if(top_picks_redirect)
+    {
+        top_picks_redirect->push_back(newpick);
+    }
+    else
     {
         std::lock_guard<std::mutex> lock(top_picks_history_mtx);
         top_picks_history.push_back(newpick);
@@ -3039,6 +3074,86 @@ mtmd_context_params init_mtmd_ctx_params(bool mmproj_cpu, bool dryrun)
     return ctx_mtmd_params;
 }
 
+static size_t kcpp_ctx_kv_bytes(const llama_context * ctx)
+{
+    size_t total = 0;
+    if(ctx)
+    {
+        const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx);
+        for(const auto & kv : mb)
+        {
+            total += kv.second.context;
+        }
+    }
+    return total;
+}
+
+//records allocated context capacity and the RoPE/YaRN configuration actually requested;
+//long-context quality is a separate claim that this runtime does not verify
+static void kcpp_build_context_profile(const llama_model * model, const llama_context_params & cparams)
+{
+    const auto & hp = model->hparams;
+    const int n_ctx_train = file_format_meta.n_ctx_train > 0 ? (int) file_format_meta.n_ctx_train : (int) hp.n_ctx_train;
+    const int rst = cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED ? (int) hp.rope_scaling_type_train : (int) cparams.rope_scaling_type;
+    const float freq_base = cparams.rope_freq_base != 0.0f ? cparams.rope_freq_base : hp.rope_freq_base_train;
+    float freq_scale = cparams.rope_freq_scale != 0.0f ? cparams.rope_freq_scale : hp.rope_freq_scale_train;
+    if(rst == LLAMA_ROPE_SCALING_TYPE_NONE)
+    {
+        freq_scale = 1.0f;
+    }
+    const int yarn_orig = cparams.yarn_orig_ctx != 0 ? (int) cparams.yarn_orig_ctx : (hp.n_ctx_orig_yarn != 0 ? (int) hp.n_ctx_orig_yarn : n_ctx_train);
+    const char * rst_name = rst == LLAMA_ROPE_SCALING_TYPE_NONE ? "none" : (rst == LLAMA_ROPE_SCALING_TYPE_LINEAR ? "linear" : (rst == LLAMA_ROPE_SCALING_TYPE_YARN ? "yarn" : (rst == LLAMA_ROPE_SCALING_TYPE_LONGROPE ? "longrope" : "unspecified")));
+    const bool scaled = (rst == LLAMA_ROPE_SCALING_TYPE_YARN || rst == LLAMA_ROPE_SCALING_TYPE_LINEAR) && freq_scale > 0.0f && freq_scale < 1.0f;
+    const int requested = max_context_limit_at_load;
+    const size_t kv_tgt = kcpp_ctx_kv_bytes(llama_ctx_v4);
+    const size_t kv_dft = kcpp_ctx_kv_bytes(draft_ctx);
+    std::string quality;
+    if(requested <= n_ctx_train)
+    {
+        quality = "within trained context; long-context quality not verified by this runtime";
+    }
+    else if(rst == LLAMA_ROPE_SCALING_TYPE_YARN && scaled)
+    {
+        quality = "beyond trained context with YaRN; long-context quality not verified by this runtime";
+    }
+    else if(scaled || freq_base != hp.rope_freq_base_train)
+    {
+        quality = "beyond trained context with linear/base RoPE adjustment; long-context quality not verified by this runtime";
+    }
+    else
+    {
+        quality = "beyond trained context without RoPE scaling; positions past the trained context are out of distribution";
+    }
+    nlohmann::json p;
+    p["requested_ctx"] = requested;
+    p["allocated_cells"] = llama_ctx_v4 ? (int) llama_n_ctx(llama_ctx_v4) : 0;
+    p["n_ctx_seq"] = llama_ctx_v4 ? (int) llama_n_ctx_seq(llama_ctx_v4) : 0;
+    p["n_seq_max"] = llama_ctx_v4 ? (int) llama_n_seq_max(llama_ctx_v4) : 0;
+    p["n_ctx_train"] = n_ctx_train;
+    p["rope_scaling"] = rst_name;
+    p["rope_freq_base"] = freq_base;
+    p["rope_freq_base_train"] = hp.rope_freq_base_train;
+    p["rope_freq_scale"] = freq_scale;
+    p["yarn_orig_ctx"] = yarn_orig;
+    p["yarn_ext_factor"] = cparams.yarn_ext_factor;
+    p["yarn_attn_factor"] = cparams.yarn_attn_factor;
+    p["yarn_beta_fast"] = cparams.yarn_beta_fast;
+    p["yarn_beta_slow"] = cparams.yarn_beta_slow;
+    p["position_coverage"] = scaled ? (int64_t) ((double) yarn_orig / freq_scale) : (int64_t) n_ctx_train;
+    p["kv_type_k"] = ggml_type_name(cparams.type_k);
+    p["kv_type_v"] = ggml_type_name(cparams.type_v);
+    p["flash_attn"] = cparams.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    p["kv_bytes_target"] = kv_tgt;
+    p["kv_bytes_draft"] = kv_dft;
+    p["capacity_status"] = "allocated";
+    p["quality_status"] = quality;
+    p["quality_verified"] = false;
+    kcpp_context_profile = p;
+    printf("\nContext profile: requested %d, allocated %d cells (%d per sequence x %d sequences), trained %d, rope %s base %.1f scale %.6f (yarn orig %d), KV %s/%s target %.2f MiB, draft %.2f MiB; %s\n",
+        requested, (int) p["allocated_cells"], (int) p["n_ctx_seq"], (int) p["n_seq_max"], n_ctx_train, rst_name, freq_base, freq_scale, yarn_orig,
+        ggml_type_name(cparams.type_k), ggml_type_name(cparams.type_v), kv_tgt / (1024.0 * 1024.0), kv_dft / (1024.0 * 1024.0), quality.c_str());
+}
+
 ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in_file_format, FileFormatExtraMeta in_file_format_meta)
 {
     is_quiet = inputs.quiet;
@@ -3054,6 +3169,13 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
     kcpp_data->n_batch = GetBatchSize(inputs.batchsize, in_file_format);
     kcpp_data->n_ubatch = inputs.ubatchsize > 0 ? std::min(inputs.ubatchsize, kcpp_data->n_batch) : kcpp_data->n_batch;
     continuous_batching_slots = (isGguf && inputs.continuous_batching_slots > 1) ? inputs.continuous_batching_slots : 0;
+    mtp_requested = inputs.use_mtp;
+    mtp_status_reason = inputs.use_mtp ? (isGguf ? "pending" : "MTP requires a GGUF model") : "not requested";
+    batch_fastforward = false;
+    batch_spec_enabled = false;
+    batch_spec_dft_rollback = false;
+    batch_tgt_seq_rm = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    kcpp_context_profile = nlohmann::json::object();
     if(continuous_batching_slots > 0)
     {
         printf("Continuous batching: prepared %d GGUF sequence slots.\n", continuous_batching_slots);
@@ -3712,6 +3834,31 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             }
         }
 
+        if(inputs.rope_scaling_type >= 0)
+        {
+            //explicit llama.cpp RoPE scaling replaces kobold's automatic NTK base adjustment
+            const llama_rope_scaling_type rst = (llama_rope_scaling_type) inputs.rope_scaling_type;
+            const int model_orig = (int) (llamamodel->hparams.n_ctx_orig_yarn > 0 ? llamamodel->hparams.n_ctx_orig_yarn : llamamodel->hparams.n_ctx_train);
+            const int orig = inputs.yarn_orig_ctx > 0 ? inputs.yarn_orig_ctx : model_orig;
+            float scale = overwriteRope ? rope_freq_scale : 0.0f; //0 = model value
+            if(!overwriteRope && (rst == LLAMA_ROPE_SCALING_TYPE_YARN || rst == LLAMA_ROPE_SCALING_TYPE_LINEAR))
+            {
+                scale = (kcpp_data->n_ctx > orig) ? (float) orig / (float) kcpp_data->n_ctx : 1.0f;
+            }
+            llama_ctx_params.rope_scaling_type = rst;
+            llama_ctx_params.rope_freq_base = overwriteRope ? rope_freq_base : 0.0f;
+            llama_ctx_params.rope_freq_scale = scale;
+            if(rst == LLAMA_ROPE_SCALING_TYPE_YARN || rst == LLAMA_ROPE_SCALING_TYPE_LINEAR)
+            {
+                llama_ctx_params.yarn_orig_ctx = orig;
+            }
+            llama_ctx_params.yarn_ext_factor = inputs.yarn_ext_factor;
+            llama_ctx_params.yarn_attn_factor = inputs.yarn_attn_factor;
+            llama_ctx_params.yarn_beta_fast = inputs.yarn_beta_fast;
+            llama_ctx_params.yarn_beta_slow = inputs.yarn_beta_slow;
+            printf("Explicit RoPE scaling: type %d, freq_scale %.6f (orig ctx %d -> %d), freq_base %s\n", (int) rst, scale, orig, kcpp_data->n_ctx, (overwriteRope ? "from --ropeconfig" : "model"));
+        }
+
         if(file_format_meta.model_architecture==llm_arch::LLM_ARCH_RWKV6 || file_format_meta.model_architecture==llm_arch::LLM_ARCH_RWKV7
         || file_format_meta.model_architecture==llm_arch::LLM_ARCH_ARWKV7 || file_format_meta.model_architecture==llm_arch::LLM_ARCH_RWKV6QWEN2)
         {
@@ -3795,6 +3942,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
                 if(inputs.use_mtp)
                 {
                     printf("\nBoth --draftmodel and --usemtp were provided. The draft model will be used for speculative decoding.\n");
+                    mtp_status_reason = "--draftmodel takes precedence over --usemtp";
                 }
                 printf("\nAttempting to load draft model for speculative decoding. It will be fully offloaded if possible. Vocab must match the main model.\n");
                 speculative_decoding_setup(draftmodel_filename, llama_ctx_v4, model_params, llama_ctx_params, n_vocab, inputs.draft_gpusplit, inputs.draft_gpulayers);
@@ -3805,13 +3953,51 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             }
 
         }
+        batch_tgt_seq_rm = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        if((draft_is_mtp && draft_spec) || continuous_batching_slots > 0)
+        {
+            batch_tgt_seq_rm = common_context_can_seq_rm(llama_ctx_v4); //note: clears the context memory
+        }
         if(draft_is_mtp && draft_spec)
         {
-            mtp_uses_spec_checkpoint = common_context_can_seq_rm(llama_ctx_v4) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+            mtp_uses_spec_checkpoint = batch_tgt_seq_rm == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
             if(mtp_uses_spec_checkpoint)
             {
                 printf("\nMTP speculative decoding will use checkpoints for draft mismatch recovery.\n");
             }
+        }
+        if(continuous_batching_slots > 0)
+        {
+            batch_fastforward = (batch_tgt_seq_rm == COMMON_CONTEXT_SEQ_RM_TYPE_PART);
+            batch_spec_enabled = false;
+            batch_spec_dft_rollback = false;
+            if(draft_spec)
+            {
+                const bool rollback_ok = batch_tgt_seq_rm == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                    (batch_tgt_seq_rm == COMMON_CONTEXT_SEQ_RM_TYPE_RS && (int) llama_n_rs_seq(llama_ctx_v4) >= speculative_chunk_amt);
+                if(!draft_is_mtp || draft_spec_type_active != COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
+                {
+                    fprintf(stderr, "\nError: parallel requests support built-in MTP drafting only (active speculative type: %s). Remove --draftmodel or use --parallelrequests 1.\n", common_speculative_type_to_str(draft_spec_type_active).c_str());
+                    return ModelLoadResult::FAIL;
+                }
+                if(!rollback_ok)
+                {
+                    fprintf(stderr, "\nError: parallel MTP needs per-sequence partial rollback, but this model's memory supports '%s' removal (n_rs_seq=%u, draft=%d). Use --parallelrequests 1 for MTP on this model.\n", kcpp_seq_rm_name(batch_tgt_seq_rm), llama_n_rs_seq(llama_ctx_v4), speculative_chunk_amt);
+                    return ModelLoadResult::FAIL;
+                }
+                batch_spec_enabled = true;
+                batch_spec_dft_rollback = draft_ctx && (llama_get_ctx_other(draft_ctx) != llama_ctx_v4 || speculative_draft_type_needs_preprocess_kv_rollback(draft_spec_type_active));
+                mtp_status_reason = "active (serial and parallel lanes)";
+            }
+            else if(inputs.use_mtp)
+            {
+                fprintf(stderr, "\nError: --usemtp was requested with parallel requests, but MTP could not be activated: %s\n", mtp_status_reason.c_str());
+                return ModelLoadResult::FAIL;
+            }
+            batch_init_slots(continuous_batching_slots);
+            printf("\nParallel requests: %d slots on sequences 1..%d (serial lane uses sequence 0), KV pool %u cells, per-sequence cap %u, prefix reuse %s, target seq_rm=%s, MTP in parallel lane: %s\n",
+                continuous_batching_slots, continuous_batching_slots, llama_n_ctx(llama_ctx_v4), llama_n_ctx_seq(llama_ctx_v4),
+                (batch_fastforward ? "on" : "off"), kcpp_seq_rm_name(batch_tgt_seq_rm), (batch_spec_enabled ? "on" : "off"));
         }
 
         //we cannot really trust the add bos in vocab. old models don't set it.
@@ -3828,6 +4014,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
                 add_bos_token = false;
             }
         }
+        kcpp_build_context_profile(llamamodel, llama_ctx_params);
         printf("Starting model warm up, please wait a moment...\n");
 
         //warmup at least 33 tokens to trigger batch
@@ -4335,7 +4522,19 @@ void AppendDedicatedMemoryAndNegativePrompt(std::vector<int> & embd_inp, const s
 }
 
 
-//alpin's batching stuff
+//LOOM parallel engine: native continuous batching for --parallelrequests (replaces the experimental
+//v1.114 "alpin" batching block). Semantics follow llama.cpp v0.5.0 llama-server slots, adapted to Kobold:
+// - admission: exact engine tokens (memory + prompt, as tokenized by the engine) plus the requested
+//   completion length must fit the request's context cap; overflow is rejected, never front-truncated.
+// - scheduling: FIFO admission into free sequence slots while the unified KV pool has room for the
+//   request's full reservation; decode/verify tokens go first, prompt chunks fill the rest of n_batch.
+// - state: every request owns its sampler state (seed/rng, rep-pen history, DRY, grammar, mirostat,
+//   adaptive-p, reasoning budget, logprobs) and its own KV sequence; slots keep their token cache for
+//   prefix reuse (fast forward) only when the context can truncate a sequence (seq_rm PART).
+// - MTP: llama.cpp common_speculative with one draft state per sequence; draft/accepted counters are
+//   reported per request and in totals.
+// - cancellation: abort touches only the target request and its sequence.
+// The serial (legacy) lane keeps the stateful features; the lanes never run concurrently.
 
 enum class BatchState
 {
@@ -4347,72 +4546,163 @@ enum class BatchState
     ABORTED,
 };
 
+enum batch_submit_error
+{
+    BATCH_OK = 0,
+    BATCH_ERR_DISABLED = 1,      //parallel lane is not enabled for this model
+    BATCH_ERR_UNSUPPORTED = 2,   //request needs a serial-only feature (media, guidance, retained grammar, phrase bans)
+    BATCH_ERR_CONTEXT = 3,       //prompt + completion reservation exceeds the context cap
+    BATCH_ERR_INVALID = 4,       //malformed request (empty prompt, bad grammar, ...)
+    BATCH_ERR_BUSY = 5,          //serial lane is active or queued
+};
+
 struct BatchGenerateRequest
 {
     int id = 0;
     int slot = -1;
+    int refs = 1;
     BatchState state = BatchState::WAITING;
-    std::string prompt;
-    std::string prompt_added_memory;
-    std::vector<std::string> stop_sequences;
-    std::vector<llama_logit_bias> logit_biases;
-    int max_context_length = 0;
+    std::atomic<bool> abort_requested{false};
+
+    //admission
+    std::vector<llama_token> prompt_tokens;
+    int n_prompt = 0;
     int max_length = 0;
-    int seed = 0;
+    int n_ctx_cap = 0;
+    int reserve = 0;
+
+    //sampling configuration, kobold semantics (see SampleLogits)
     float temperature = 0.0f;
     int top_k = 0;
+    float top_a = 0.0f;
     float top_p = 1.0f;
     float min_p = 0.0f;
     float typical_p = 1.0f;
+    float tfs = 1.0f;
+    float nsigma = 0.0f;
     float rep_pen = 1.0f;
     float rep_pen_slope = 1.0f;
-    int rep_pen_range = 0;
+    int rep_pen_range = 1;
     float presence_penalty = 0.0f;
+    int mirostat = 0;
+    float mirostat_tau = 5.0f;
+    float mirostat_eta = 0.1f;
+    float dry_multiplier = 0.0f;
+    float dry_base = 1.75f;
+    int dry_allowed_length = 2;
+    int dry_penalty_last_n = 0;
+    float xtc_threshold = 0.0f;
+    float xtc_probability = 0.0f;
+    float dynatemp_range = 0.0f;
+    float dynatemp_exponent = 1.0f;
+    float smoothing_factor = 0.0f;
+    float smoothing_curve = 1.0f;
+    float adaptive_target = -1.0f;
+    float adaptive_decay = 0.9f;
+    int reasoning_budget = -1;
+    std::vector<samplers> sampler_order;
+    uint32_t seed = 0;
     bool allow_eos_token = true;
     bool bypass_eos_token = false;
     bool render_special = false;
-    std::vector<llama_token> prompt_tokens;
+    bool tool_call_fix = false;
+    std::vector<logit_bias> logit_biases;
+    std::unordered_multimap<gpt_vocab::id, std::vector<gpt_vocab::id>> dry_breakers;
+    std::vector<int> banned_token_ids;
+    std::vector<int> toolcall_prevented;
+    std::vector<int> eog_ids;
+    std::vector<std::string> stop_sequences;
+    size_t max_stop_len = 0;
+    std::vector<int> special_stops;
+    std::vector<int> think_start;
+    std::vector<int> think_end;
+    std::vector<int> think_phrase;
+    llama_grammar * grammar = nullptr;
+
+    //sampling state, private to this request
+    std::mt19937 rng;
+    std::vector<int> last_n_tokens;
+    std::vector<int> context_tokens;
+    float adaptive_sum = 0.0f;
+    float adaptive_weight = 0.0f;
+    float mirostat_mu = 0.0f;
+    std::vector<TopPicksData> top_picks;
+
+    //decode progress, owned by the worker
     int prompt_pos = 0;
     int n_past = 0;
+    int n_reused = 0;
     bool has_pending = false;
     llama_token pending_token = 0;
-    int i_batch = -1;
-    bool i_batch_is_prefill = false;
-    llama_sampler * sampler = nullptr;
+    std::vector<llama_token> kv_tokens; //tokens committed to this request's KV sequence, in order
+    std::vector<llama_token> draft;
+    std::vector<int> rows;
+    bool in_batch = false;
+
+    //output, written by the worker under batch_mutex
+    int n_generated = 0;
     std::vector<std::string> generated_pieces;
     std::string output;
-    int prompt_token_count = 0;
-    int completion_token_count = 0;
+    int draft_n = 0;
+    int draft_accepted = 0;
+    int draft_steps = 0;
+    std::chrono::steady_clock::time_point submit_time;
     std::chrono::steady_clock::time_point start_time;
-    std::chrono::steady_clock::time_point process_start_time;
     std::chrono::steady_clock::time_point generation_start_time;
-    float init_time = 0.0f;
+    float queue_time = 0.0f;
     float process_time = 0.0f;
     stop_reason finish_reason = stop_reason::INVALID;
-    bool abort_requested = false;
     generation_outputs result;
+    std::string error;
 
     ~BatchGenerateRequest()
     {
-        if(sampler)
+        if(grammar)
         {
-            llama_sampler_free(sampler);
-            sampler = nullptr;
+            llama_grammar_free_impl(grammar);
+            grammar = nullptr;
         }
     }
+};
+
+struct BatchSlot
+{
+    int seq = 0;
+    int request_id = -1;
+    std::vector<llama_token> cache_tokens; //tokens left in this slot's KV sequence by the previous request
+    uint64_t last_used = 0;
+};
+
+struct BatchTotals
+{
+    uint64_t submitted = 0;
+    uint64_t completed = 0;
+    uint64_t aborted = 0;
+    uint64_t failed = 0;
+    uint64_t rejected_context = 0;
+    uint64_t rejected_unsupported = 0;
+    uint64_t prompt_tokens = 0;
+    uint64_t reused_tokens = 0;
+    uint64_t completion_tokens = 0;
+    uint64_t draft_tokens = 0;
+    uint64_t draft_accepted = 0;
+    uint64_t decode_calls = 0;
+    int peak_live = 0;
 };
 
 static std::mutex batch_mutex;
 static std::condition_variable batch_cv;
 static std::deque<int> batch_waiting;
 static std::vector<std::unique_ptr<BatchGenerateRequest>> batch_requests;
+static std::vector<BatchSlot> batch_slots;
 static std::thread batch_worker_thread;
 static bool batch_worker_stop = false;
 static bool batch_worker_started = false;
 static bool batch_legacy_active = false;
-static bool batch_touched_since_legacy = false;
 static int batch_legacy_waiting = 0;
 static int batch_next_request_id = 1;
+static uint64_t batch_use_counter = 0;
+static BatchTotals batch_totals;
 static std::string batch_empty_string = "";
 
 static BatchGenerateRequest * batch_find_request_locked(int request_id)
@@ -4429,7 +4719,12 @@ static BatchGenerateRequest * batch_find_request_locked(int request_id)
 
 static bool batch_is_live_state(BatchState state)
 {
-    return state == BatchState::WAITING || state == BatchState::PREFILL || state == BatchState::GENERATING;
+    return state == BatchState::PREFILL || state == BatchState::GENERATING;
+}
+
+static bool batch_is_pending_state(BatchState state)
+{
+    return state == BatchState::WAITING || batch_is_live_state(state);
 }
 
 static bool batch_has_live_locked()
@@ -4444,30 +4739,60 @@ static bool batch_has_live_locked()
     return false;
 }
 
-static void batch_invalidate_legacy_context_locked()
+static int batch_seq_pos_count(llama_context * ctx, int seq)
 {
-    if(!batch_touched_since_legacy)
+    if(!ctx)
     {
-        return;
+        return 0;
     }
-    batch_touched_since_legacy = false;
+    const llama_pos p = llama_memory_seq_pos_max(llama_get_memory(ctx), seq);
+    return p < 0 ? 0 : (int) p + 1;
+}
+
+static void batch_seq_clear(int seq)
+{
+    if(llama_ctx_v4)
+    {
+        llama_memory_seq_rm(llama_get_memory(llama_ctx_v4), seq, -1, -1);
+    }
+    if(draft_ctx)
+    {
+        llama_memory_seq_rm(llama_get_memory(draft_ctx), seq, -1, -1);
+    }
+}
+
+//truncate one sequence to its first `keep` positions in both target and draft contexts
+static bool batch_seq_keep(int seq, int keep)
+{
+    bool ok = llama_memory_seq_rm(llama_get_memory(llama_ctx_v4), seq, keep, -1);
+    if(draft_ctx)
+    {
+        ok = llama_memory_seq_rm(llama_get_memory(draft_ctx), seq, keep, -1) && ok;
+    }
+    return ok;
+}
+
+static void batch_clear_slot_caches_locked()
+{
+    for(auto & slot : batch_slots)
+    {
+        if(slot.request_id < 0 && !slot.cache_tokens.empty())
+        {
+            batch_seq_clear(slot.seq);
+            slot.cache_tokens.clear();
+        }
+    }
+}
+
+//the serial lane uses sequence 0; evicting it keeps its bookkeeping consistent with the KV cache
+static void batch_clear_legacy_sequence_locked()
+{
     n_past = 0;
     current_context_tokens.clear();
     last_n_tokens.clear();
     smartcontext.clear();
     loaded_latest_logits.clear();
-    if(llama_ctx_v4)
-    {
-        llama_memory_seq_rm(llama_get_memory(llama_ctx_v4), 0, -1, -1);
-    }
-    if(draft_ctx)
-    {
-        llama_memory_seq_rm(llama_get_memory(draft_ctx), 0, -1, -1);
-    }
-    if(debugmode==1 && !is_quiet)
-    {
-        printf("\n[Continuous batching touched shared context; forcing next legacy generation to reprocess prompt]\n");
-    }
+    batch_seq_clear(0);
 }
 
 class BatchLegacyGuard
@@ -4480,7 +4805,8 @@ public:
         batch_cv.notify_all();
         batch_cv.wait(lock, [](){ return !batch_legacy_active && !batch_has_live_locked(); });
         batch_legacy_waiting--;
-        batch_invalidate_legacy_context_locked();
+        //idle parallel slots give their KV cells back to the serial lane
+        batch_clear_slot_caches_locked();
         batch_legacy_active = true;
     }
 
@@ -4492,370 +4818,636 @@ public:
     }
 };
 
-static bool batch_inputs_eligible(const generation_inputs & inputs)
+static int batch_pool_cells()
 {
-    if(continuous_batching_slots <= 1 || file_format != FileFormat::GGUF_GENERIC || !llama_ctx_v4 || !kcpp_data)
+    return llama_ctx_v4 ? (int) llama_n_ctx(llama_ctx_v4) : 0;
+}
+
+static int batch_reserved_cells_locked()
+{
+    int total = 0;
+    for(const auto & req : batch_requests)
     {
-        return false;
-    }
-    if(draft_ctx || guidance_ctx || inputs.images_len>0 || inputs.audio_len>0)
-    {
-        return false;
-    }
-    if(kcpp_data->use_smartcontext || kcpp_data->use_contextshift || kcpp_data->smartcache)
-    {
-        return false;
-    }
-    if(inputs.negative_prompt && std::string(inputs.negative_prompt).size() > 0)
-    {
-        return false;
-    }
-    if(inputs.images_len > 0 || inputs.audio_len > 0 || inputs.guidance_scale != 1.0f)
-    {
-        return false;
-    }
-    if(inputs.grammar && std::string(inputs.grammar).size() > 0)
-    {
-        return false;
-    }
-    if(inputs.banned_tokens_len > 0 || inputs.dry_multiplier > 0.0f)
-    {
-        return false;
-    }
-    if(inputs.mirostat != 0 || inputs.xtc_probability > 0.0f || inputs.nsigma > 0.0f || inputs.smoothing_factor > 0.0f || inputs.adaptive_target > 0.0f)
-    {
-        return false;
-    }
-    if(inputs.top_a > 0.0f || inputs.tfs != 1.0f || inputs.dynatemp_range > 0.0f)
-    {
-        return false;
-    }
-    static const int default_sampler_order[] = {6, 0, 1, 3, 4, 2, 5};
-    if(inputs.sampler_len > 0)
-    {
-        if(inputs.sampler_len != 7)
+        if(req && batch_is_live_state(req->state))
         {
-            return false;
-        }
-        for(int i = 0; i < 7; ++i)
-        {
-            if((int) inputs.sampler_order[i] != default_sampler_order[i])
-            {
-                return false;
-            }
+            total += req->reserve;
         }
     }
-    if(inputs.reasoning_budget >= 0 || inputs.tool_call_fix)
+    return total;
+}
+
+static int batch_cached_cells_locked()
+{
+    int total = 0;
+    for(const auto & slot : batch_slots)
     {
+        if(slot.request_id < 0)
+        {
+            total += (int) slot.cache_tokens.size();
+        }
+    }
+    return total;
+}
+
+static int batch_common_prefix(const std::vector<llama_token> & a, const std::vector<llama_token> & b)
+{
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while(i < n && a[i] == b[i])
+    {
+        ++i;
+    }
+    return (int) i;
+}
+
+//thinking budget sequences, shared with the serial lane
+static void kcpp_get_thinking_sequences(std::vector<int> & start_seq, std::vector<int> & end_seq, std::vector<int> & phrase_seq)
+{
+    start_seq.clear();
+    end_seq.clear();
+    phrase_seq.clear();
+    if (file_format != FileFormat::GGUF_GENERIC) {
+        return;
+    }
+    std::string start = "<think>";
+    std::string end = "</think>";
+    std::string  budget_exceeded = "\n(Reasoning budget exceeded)\nTime to respond now.\n</think>";
+    size_t expected_start_tokens = 1;
+    size_t expected_end_tokens = 1;
+
+    switch (file_format_meta.model_architecture) {
+        case llm_arch::LLM_ARCH_GEMMA4:
+            start = "<|channel>thought";
+            end = "<channel|>";
+            budget_exceeded = "\n(Reasoning budget exceeded)\nTime to respond now.\n<channel|>";
+            expected_start_tokens = 2;
+            break;
+        case llm_arch::LLM_ARCH_SEED_OSS:
+            start = "<seed:think>";
+            end = "</seed:think>";
+            budget_exceeded = "\n(Reasoning budget exceeded)\n<seed:cot_budget_reflect>The current thinking budget is 0, so I will directly start answering the question.</seed:cot_budget_reflect>\nTime to respond now.\n</seed:think>";
+            break;
+        case llm_arch::LLM_ARCH_COHERE2MOE:
+            start = "<|START_THINKING|>";
+            end = "<|END_THINKING|>";
+             budget_exceeded = "\n(Reasoning budget exceeded)\nTime to respond now.\n<|END_THINKING|>";
+            break;
+        case llm_arch::LLM_ARCH_MISTRAL3:
+            start = "[THINK]";
+            end = "[/THINK]";
+            budget_exceeded = "\n(Reasoning budget exceeded)\nTime to respond now.\n[/THINK]";
+            break;
+        case llm_arch::LLM_ARCH_MUSE_GLIMMER:
+            start = " to=self<|message|>";
+            end = "<|eom|>";
+            budget_exceeded = "\n(Reasoning budget exceeded)\nTime to respond now.\n<|eom|>";
+            expected_start_tokens = 3;
+            break;
+        default:
+            break;
+    }
+
+    TokenizeString(start, start_seq, file_format, false);
+    TokenizeString(end, end_seq, file_format, false);
+    TokenizeString(budget_exceeded, phrase_seq, file_format, false);
+    if (start_seq.size() != expected_start_tokens || end_seq.size() != expected_end_tokens)
+    {
+        start_seq.clear();
+        end_seq.clear();
+        phrase_seq.clear();
+    }
+}
+
+//exact engine tokenization of a request: the same steps the serial lane applies before decoding
+//(prompt format adjustments, BOS handling, dedicated memory), without any truncation.
+static bool batch_tokenize_request(const generation_inputs & inputs, std::vector<llama_token> & out, std::string & err)
+{
+    std::string prompt = inputs.prompt ? inputs.prompt : "";
+    std::string memory = inputs.memory ? inputs.memory : "";
+    ApplyPromptFormatAdjustments(memory, prompt);
+    std::vector<int> prompt_tokens;
+    std::vector<int> memory_tokens;
+    TokenizeString(prompt, prompt_tokens, file_format, add_bos_token);
+    if(memory != "")
+    {
+        TokenizeString(memory, memory_tokens, file_format, add_bos_token);
+        std::vector<int> bos;
+        TokenizeString("", bos, file_format, add_bos_token);
+        if(bos.size() > 0 && !prompt_tokens.empty() && bos[0] == prompt_tokens[0])
+        {
+            prompt_tokens.erase(prompt_tokens.begin());
+        }
+        prompt_tokens.insert(prompt_tokens.begin(), memory_tokens.begin(), memory_tokens.end());
+        if(add_bos_token && prompt_tokens.size() > 0 && bos.size() > 0 && bos[0] != prompt_tokens[0])
+        {
+            prompt_tokens.insert(prompt_tokens.begin(), bos[0]);
+        }
+    }
+    if(prompt_tokens.empty())
+    {
+        err = "empty prompt: the parallel lane needs at least one prompt token";
         return false;
     }
+    out.assign(prompt_tokens.begin(), prompt_tokens.end());
     return true;
 }
 
-struct BatchRepPenSampler
+static int batch_request_ctx_cap(const generation_inputs & inputs)
 {
-    int32_t penalty_last_n = 0;
-    float penalty_repeat = 1.0f;
-    float penalty_slope = 1.0f;
-    float penalty_present = 0.0f;
-    std::vector<llama_token> prev;
-};
-
-static const char * batch_rep_pen_name(const llama_sampler * /*smpl*/)
-{
-    return "kcpp-batch-rep-pen";
+    const int seq_cap = llama_ctx_v4 ? (int) llama_n_ctx_seq(llama_ctx_v4) : 0;
+    int cap = std::min(max_context_limit_at_load, seq_cap); //kcpp_data->n_ctx is rewritten by every serial request
+    if(inputs.max_context_length > 0)
+    {
+        cap = std::min(cap, inputs.max_context_length);
+    }
+    return cap;
 }
 
-static void batch_rep_pen_accept(llama_sampler * smpl, llama_token token)
+//features that keep state outside a single request, or need the serial lane's media/guidance contexts
+static const char * batch_unsupported_reason(const generation_inputs & inputs)
 {
-    auto * ctx = (BatchRepPenSampler *) smpl->ctx;
-    if(ctx->penalty_last_n <= 0)
+    if(inputs.images_len > 0 || inputs.audio_len > 0)
     {
-        return;
+        return "multimodal (image/audio) input is served by the serial lane only";
     }
-    if(ctx->prev.size() >= (size_t) ctx->penalty_last_n)
+    if(inputs.negative_prompt && std::string(inputs.negative_prompt).size() > 0 && inputs.guidance_scale != 1.0f)
     {
-        ctx->prev.erase(ctx->prev.begin());
+        return "classifier-free guidance (negative_prompt) is served by the serial lane only";
     }
-    ctx->prev.push_back(token);
-}
-
-static void batch_rep_pen_apply(llama_sampler * smpl, llama_token_data_array * cur_p)
-{
-    auto * ctx = (BatchRepPenSampler *) smpl->ctx;
-    int last_n_repeat = std::min((int) ctx->prev.size(), ctx->penalty_last_n);
-    if(last_n_repeat <= 0 || (ctx->penalty_repeat == 1.0f && ctx->penalty_present == 0.0f))
+    if(inputs.grammar_retain_state)
     {
-        return;
+        return "grammar_retain_state carries grammar state across requests and is served by the serial lane only";
     }
-
-    const llama_token * last_tokens = ctx->prev.data() + ctx->prev.size() - last_n_repeat;
-    std::unordered_set<llama_token> tokens_near(last_tokens + last_n_repeat / 2, last_tokens + last_n_repeat);
-    std::unordered_set<llama_token> tokens_far(last_tokens, last_tokens + last_n_repeat / 2);
-
-    float penalty_reduced = ctx->penalty_repeat;
-    if(penalty_reduced > 1.0f)
+    for(int x = 0; x < inputs.banned_tokens_len; ++x)
     {
-        penalty_reduced = 1.0f + ((ctx->penalty_repeat - 1.0f) * ctx->penalty_slope);
-    }
-
-    for(size_t i = 0; i < cur_p->size; ++i)
-    {
-        const bool token_in_near = tokens_near.find(cur_p->data[i].id) != tokens_near.end();
-        const bool token_in_far = tokens_far.find(cur_p->data[i].id) != tokens_far.end();
-        if(!token_in_near && !token_in_far)
+        std::string word = inputs.banned_tokens[x] ? inputs.banned_tokens[x] : "";
+        word = toLowerCase(word);
+        if(word == "")
         {
             continue;
         }
-
-        float penalty = token_in_near ? ctx->penalty_repeat : penalty_reduced;
-        if(cur_p->data[i].logit <= 0)
+        std::vector<int> toks;
+        TokenizeString(word, toks, file_format, false);
+        if(toks.size() > 1 || word.length() >= 12)
         {
-            cur_p->data[i].logit *= penalty;
+            return "phrase bans (antislop backtracking) are served by the serial lane only";
         }
-        else
-        {
-            cur_p->data[i].logit /= penalty;
-        }
-        cur_p->data[i].logit -= ctx->penalty_present;
     }
-
-    cur_p->sorted = false;
+    return nullptr;
 }
 
-static void batch_rep_pen_reset(llama_sampler * smpl)
+static llama_grammar * batch_parse_grammar(const std::string & str, std::string & err)
 {
-    auto * ctx = (BatchRepPenSampler *) smpl->ctx;
-    ctx->prev.clear();
+    if(str.empty())
+    {
+        return nullptr;
+    }
+    try
+    {
+        llama_grammar_parser parser;
+        parser.parse(str.c_str());
+        if(parser.rules.empty() || parser.symbol_ids.find("root") == parser.symbol_ids.end())
+        {
+            err = "grammar failed to parse";
+            return nullptr;
+        }
+        std::vector<const llama_grammar_element *> rules(parser.c_rules());
+        llama_grammar * g = llama_grammar_init_impl(nullptr, rules.data(), rules.size(), parser.symbol_ids.at("root"));
+        if(!g)
+        {
+            err = "grammar failed to initialize";
+        }
+        return g;
+    }
+    catch(const std::exception & e)
+    {
+        err = std::string("grammar failed to parse: ") + e.what();
+        return nullptr;
+    }
 }
 
-static llama_sampler * batch_rep_pen_clone(const llama_sampler * smpl)
+struct BatchSamplerStateSwap
 {
-    const auto * ctx = (const BatchRepPenSampler *) smpl->ctx;
-    auto * result = llama_sampler_init(smpl->iface, new BatchRepPenSampler {
-        ctx->penalty_last_n,
-        ctx->penalty_repeat,
-        ctx->penalty_slope,
-        ctx->penalty_present,
-        ctx->prev,
-    });
-    return result;
-}
-
-static void batch_rep_pen_free(llama_sampler * smpl)
-{
-    delete (BatchRepPenSampler *) smpl->ctx;
-}
-
-static llama_sampler_i batch_rep_pen_i = {
-    /* .name              = */ batch_rep_pen_name,
-    /* .accept            = */ batch_rep_pen_accept,
-    /* .apply             = */ batch_rep_pen_apply,
-    /* .reset             = */ batch_rep_pen_reset,
-    /* .clone             = */ batch_rep_pen_clone,
-    /* .free              = */ batch_rep_pen_free,
-    /* .backend_init      = */ nullptr,
-    /* .backend_accept    = */ nullptr,
-    /* .backend_apply     = */ nullptr,
-    /* .backend_set_input = */ nullptr,
+    BatchGenerateRequest & req;
+    explicit BatchSamplerStateSwap(BatchGenerateRequest & r) : req(r)
+    {
+        std::swap(last_n_tokens, req.last_n_tokens);
+        std::swap(current_context_tokens, req.context_tokens);
+        std::swap(dry_sequence_breakers, req.dry_breakers);
+        top_picks_redirect = &req.top_picks; //logprobs stay private to the request
+    }
+    ~BatchSamplerStateSwap()
+    {
+        top_picks_redirect = nullptr;
+        std::swap(dry_sequence_breakers, req.dry_breakers);
+        std::swap(current_context_tokens, req.context_tokens);
+        std::swap(last_n_tokens, req.last_n_tokens);
+    }
 };
 
-static llama_sampler * batch_rep_pen_init(int32_t penalty_last_n, float penalty_repeat, float penalty_slope, float penalty_present)
+//per-request equivalent of SampleLogits (kobold sampler semantics) using request-local state
+static llama_token batch_sample_token(BatchGenerateRequest & req, const float * logits)
 {
-    penalty_last_n = std::max(penalty_last_n, 0);
-    if(penalty_slope <= 0.0f || penalty_slope > 1.0f)
-    {
-        penalty_slope = 1.0f;
+    static thread_local std::vector<llama_token_data> candidates;
+    candidates.resize(n_vocab);
+    for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+        candidates[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
     }
-    return llama_sampler_init(&batch_rep_pen_i, new BatchRepPenSampler {
-        penalty_last_n,
-        penalty_repeat <= 0.0f ? 1.0f : penalty_repeat,
-        penalty_slope,
-        penalty_present,
-        {},
-    });
-}
+    float lowest = LowestLogit(logits, n_vocab);
+    if (!req.allow_eos_token && !req.bypass_eos_token)
+    {
+        for(int eid : req.eog_ids)
+        {
+            candidates[eid].logit = lowest;
+        }
+    }
+    for(int t : req.banned_token_ids)
+    {
+        candidates[t].logit = lowest;
+    }
+    if(!req.toolcall_prevented.empty() && req.n_generated < 3 && std::count(req.output.begin(), req.output.end(), '[') <= 1)
+    {
+        for(int t : req.toolcall_prevented)
+        {
+            candidates[t].logit = lowest;
+        }
+    }
+    for(const auto & itm : req.logit_biases)
+    {
+        candidates[itm.token_id].logit += itm.bias;
+    }
+    llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
 
-static llama_sampler * batch_build_sampler(const BatchGenerateRequest & req)
-{
-    llama_sampler_chain_params params = llama_sampler_chain_default_params();
-    llama_sampler * chain = llama_sampler_chain_init(params);
-    llama_sampler_chain_add(chain, batch_rep_pen_init(
-        req.rep_pen_range,
-        req.rep_pen,
-        req.rep_pen_slope,
-        req.presence_penalty));
-    if(req.logit_biases.size()>0)
+    //the shared sampler helpers read history/breaker globals: point them at this request's state.
+    //only the worker samples while the parallel lane runs (BatchLegacyGuard excludes the serial lane)
+    BatchSamplerStateSwap state_swap(req);
+
+    llama_token id = 0;
+    const int n_ctx = req.n_ctx_cap;
+    const int newid = apply_reasoning_budget(id, req.think_start, req.think_end, req.think_phrase, req.reasoning_budget);
+    if(id != newid)
     {
-        int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(llama_ctx_v4)));
-        llama_sampler_chain_add(chain, llama_sampler_init_logit_bias(n_vocab, req.logit_biases.size(), req.logit_biases.data()));
-    }
-    if(req.top_k > 0)
-    {
-        llama_sampler_chain_add(chain, llama_sampler_init_top_k(req.top_k));
-    }
-    if(req.top_p > 0.0f && req.top_p < 1.0f)
-    {
-        llama_sampler_chain_add(chain, llama_sampler_init_top_p(req.top_p, 1));
-    }
-    if(req.min_p > 0.0f)
-    {
-        llama_sampler_chain_add(chain, llama_sampler_init_min_p(req.min_p, 1));
-    }
-    if(req.typical_p > 0.0f && req.typical_p < 1.0f)
-    {
-        llama_sampler_chain_add(chain, llama_sampler_init_typical(req.typical_p, 1));
-    }
-    if(req.temperature > 0.0f)
-    {
-        llama_sampler_chain_add(chain, llama_sampler_init_temp(req.temperature));
-        llama_sampler_chain_add(chain, llama_sampler_init_dist(req.seed < 0 ? LLAMA_DEFAULT_SEED : (uint32_t) req.seed));
+        candidates[newid].logit += 99999;
+        sample_top_k(&candidates_p, 1);
+        id = sample_token(&candidates_p, req.rng);
     }
     else
     {
-        llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+        sample_dry(n_ctx, req.dry_penalty_last_n, req.dry_multiplier, req.dry_base, req.dry_allowed_length, dry_sequence_breakers, &candidates_p);
+        std::vector<llama_token_data> precache = (req.grammar ? std::vector<llama_token_data>(candidates) : std::vector<llama_token_data>(0));
+        sample_top_k(&candidates_p, 3000);
+        if(req.grammar)
+        {
+            sample_grammar(file_format, n_vocab, &candidates_p, req.grammar);
+            if (candidates_p.size <= 0) {
+                candidates_p = { precache.data(), precache.size(), false };
+                sample_grammar(file_format, n_vocab, &candidates_p, req.grammar);
+                sample_top_k(&candidates_p, 3000);
+            }
+        }
+        if(req.mirostat == 1 || req.mirostat == 2)
+        {
+            sample_rep_pen(n_ctx, req.rep_pen_range, req.rep_pen, req.rep_pen_slope, req.presence_penalty, &candidates_p);
+            sample_temperature(&candidates_p, req.temperature, req.smoothing_factor, req.smoothing_curve);
+            if(req.mirostat == 1)
+            {
+                id = sample_token_mirostat(n_vocab, &candidates_p, req.rng, req.mirostat_tau, req.mirostat_eta, 100, &req.mirostat_mu);
+            }
+            else
+            {
+                id = sample_token_mirostat_v2(&candidates_p, req.rng, req.mirostat_tau, req.mirostat_eta, &req.mirostat_mu);
+            }
+        }
+        else
+        {
+            for (size_t i = 0; i < req.sampler_order.size(); i++)
+            {
+                switch (req.sampler_order[i])
+                {
+                    case KCPP_SAMPLER_TOP_K:
+                        sample_top_k(&candidates_p, req.top_k);
+                        break;
+                    case KCPP_SAMPLER_TOP_A:
+                        sample_top_a(&candidates_p, req.top_a, 1);
+                        break;
+                    case KCPP_SAMPLER_TOP_P:
+                        sample_top_p(&candidates_p, req.top_p, 1);
+                        sample_min_p(&candidates_p, req.min_p, 1);
+                        break;
+                    case KCPP_SAMPLER_TFS:
+                        sample_tail_free(&candidates_p, req.tfs, 1);
+                        break;
+                    case KCPP_SAMPLER_TYP:
+                        sampler_typical(&candidates_p, req.typical_p, 1);
+                        break;
+                    case KCPP_SAMPLER_TEMP:
+                        if (req.dynatemp_range!=0)
+                        {
+                            float dynatemp_min = std::max(0.0f, req.temperature - req.dynatemp_range);
+                            float dynatemp_max = std::max(0.0f, req.temperature + req.dynatemp_range);
+                            float dynatemp_exponent = std::max(0.0f, req.dynatemp_exponent);
+                            sample_entropy(&candidates_p, dynatemp_min, dynatemp_max, dynatemp_exponent, req.smoothing_factor, req.smoothing_curve);
+                        }
+                        else
+                        {
+                            sample_temperature(&candidates_p, req.temperature, req.smoothing_factor, req.smoothing_curve);
+                        }
+                        if (req.nsigma > 0.0f)
+                        {
+                            sample_top_n_sigma(&candidates_p, req.nsigma);
+                        }
+                        break;
+                    case KCPP_SAMPLER_REP_PEN:
+                        sample_rep_pen(n_ctx, req.rep_pen_range, req.rep_pen, req.rep_pen_slope, req.presence_penalty, &candidates_p);
+                        break;
+                    default:
+                        break;
+                }
+            }
+            sample_xtc(&candidates_p, req.xtc_threshold, req.xtc_probability, req.rng);
+            id = sample_adaptive_p(req.adaptive_target, req.adaptive_sum, req.adaptive_weight, &candidates_p, req.adaptive_decay, req.rng);
+        }
     }
-    return chain;
+
+    if(req.grammar)
+    {
+        grammar_accept_token(file_format, n_vocab, req.grammar, id);
+    }
+    if (!last_n_tokens.empty())
+    {
+        last_n_tokens.erase(last_n_tokens.begin());
+    }
+    last_n_tokens.push_back(id);
+    current_context_tokens.push_back(id);
+
+    return id;
 }
 
-static void batch_finish_request_locked(BatchGenerateRequest & req, stop_reason reason)
+static void batch_release_slot_locked(BatchGenerateRequest & req, bool keep_cache)
 {
-    auto finish_time = std::chrono::steady_clock::now();
-    float total_time = req.start_time.time_since_epoch().count() == 0 ? 0.0f : std::chrono::duration<float>(finish_time - req.start_time).count();
-    float init_time = req.init_time;
-    float process_time = req.process_time;
-    float gen_time = req.generation_start_time.time_since_epoch().count() == 0 ? 0.0f : std::chrono::duration<float>(finish_time - req.generation_start_time).count();
-    if(process_time == 0.0f && req.prompt_token_count > 0 && total_time > 0.0f)
+    if(req.slot < 0)
     {
-        process_time = std::max(0.0f, total_time - init_time);
+        return;
     }
-    float processed_tps = process_time > 0.0f ? (float) req.prompt_token_count / process_time : 0.0f;
-    float generated_tps = gen_time > 0.0f ? (float) req.completion_token_count / gen_time : 0.0f;
+    BatchSlot & slot = batch_slots[req.slot];
+    slot.request_id = -1;
+    slot.last_used = ++batch_use_counter;
+    slot.cache_tokens.clear();
+    if(keep_cache && batch_fastforward && (int) req.kv_tokens.size() == batch_seq_pos_count(llama_ctx_v4, slot.seq))
+    {
+        slot.cache_tokens = std::move(req.kv_tokens);
+    }
+    else
+    {
+        batch_seq_clear(slot.seq);
+    }
+    req.kv_tokens.clear();
+    req.slot = -1;
+}
+
+static void batch_finish_request_locked(BatchGenerateRequest & req, stop_reason reason, const std::string & error = "")
+{
+    const bool was_live = batch_is_live_state(req.state); //live requests are only finished by the worker
+    auto finish_time = std::chrono::steady_clock::now();
+    const bool started = req.start_time.time_since_epoch().count() != 0;
+    const float total_time = started ? std::chrono::duration<float>(finish_time - req.start_time).count() : 0.0f;
+    const float gen_time = req.generation_start_time.time_since_epoch().count() == 0 ? 0.0f : std::chrono::duration<float>(finish_time - req.generation_start_time).count();
+    const int n_processed = std::max(0, req.n_prompt - req.n_reused);
+    const float processed_tps = req.process_time > 0.0f ? (float) n_processed / req.process_time : 0.0f;
+    const float generated_tps = gen_time > 0.0f ? (float) req.n_generated / gen_time : 0.0f;
+
     req.finish_reason = reason;
+    req.error = error;
     req.result.status = (reason == stop_reason::ERROR_ENCOUNTERED) ? 0 : 1;
     req.result.stopreason = reason;
-    req.result.prompt_tokens = req.prompt_token_count;
-    req.result.completion_tokens = req.completion_token_count;
-    req.result.text = req.output.c_str();
+    req.result.prompt_tokens = req.n_prompt;
+    req.result.completion_tokens = req.n_generated;
+    req.result.draft_tokens = req.draft_n;
+    req.result.draft_accepted = req.draft_accepted;
+    req.result.text = nullptr;
     req.state = reason == stop_reason::ERROR_ENCOUNTERED ? BatchState::FAILED : (reason == stop_reason::INVALID ? BatchState::ABORTED : BatchState::FINISHED);
-    if(req.slot >= 0 && llama_ctx_v4)
+
+    if(req.grammar)
     {
-        llama_memory_seq_rm(llama_get_memory(llama_ctx_v4), req.slot, -1, -1);
+        //grammar memos are keyed by rule addresses; drop them before the rules can be reused
+        llama_grammar_free_impl(req.grammar);
+        req.grammar = nullptr;
+        if(was_live)
+        {
+            llama_grammar_reset_memos(); //the worker is the only thread using the memo cache
+        }
     }
-    req.slot = -1;
-    printf("\n[%s] BatchRequest:%d, Init:%.2fs, Processed:%d in %.2fs (%.2fT/s), Generated:%d/%d in %.2fs (%.2fT/s), Total:%.2fs, Stop:%d",
-        get_timestamp_str().c_str(), req.id, init_time, req.prompt_token_count, process_time, processed_tps, req.completion_token_count, req.max_length, gen_time, generated_tps, total_time, (int) reason);
-    fflush(stdout);
+    batch_release_slot_locked(req, req.state == BatchState::FINISHED);
+
+    if(req.state == BatchState::FINISHED)
+    {
+        batch_totals.completed++;
+    }
+    else if(req.state == BatchState::ABORTED)
+    {
+        batch_totals.aborted++;
+    }
+    else
+    {
+        batch_totals.failed++;
+    }
+    batch_totals.completion_tokens += req.n_generated;
+    batch_totals.draft_tokens += req.draft_n;
+    batch_totals.draft_accepted += req.draft_accepted;
+
+    if(!is_quiet && debugmode != -1)
+    {
+        printf("\n[%s] Parallel Request %d: Queue:%.2fs, Prompt:%d (reused %d) in %.2fs (%.2fT/s), Generated:%d/%d in %.2fs (%.2fT/s), Draft:%d/%d accepted, Total:%.2fs, Stop:%d%s%s",
+            get_timestamp_str().c_str(), req.id, req.queue_time, req.n_prompt, req.n_reused, req.process_time, processed_tps,
+            req.n_generated, req.max_length, gen_time, generated_tps, req.draft_accepted, req.draft_n, total_time, (int) reason,
+            error.empty() ? "" : ", Error: ", error.c_str());
+        fflush(stdout);
+    }
     batch_cv.notify_all();
 }
 
-static bool batch_output_hit_stop(const BatchGenerateRequest & req)
-{
-    for(const auto & stopper : req.stop_sequences)
-    {
-        if(!stopper.empty() && req.output.find(stopper) != std::string::npos)
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
+//admit waiting requests in FIFO order while a slot is free and the KV pool can hold the full reservation
 static bool batch_claim_waiting_locked()
 {
     bool claimed = false;
-    for(int slot = 1; slot <= continuous_batching_slots && !batch_waiting.empty(); ++slot)
+    const int pool = batch_pool_cells();
+    while(!batch_waiting.empty())
     {
-        bool occupied = false;
-        for(const auto & req : batch_requests)
-        {
-            if(req && req->slot == slot && batch_is_live_state(req->state))
-            {
-                occupied = true;
-                break;
-            }
-        }
-        if(occupied)
-        {
-            continue;
-        }
-        int request_id = batch_waiting.front();
-        batch_waiting.pop_front();
-        BatchGenerateRequest * req = batch_find_request_locked(request_id);
+        BatchGenerateRequest * req = batch_find_request_locked(batch_waiting.front());
         if(!req || req->state != BatchState::WAITING)
         {
+            batch_waiting.pop_front();
             continue;
         }
-        req->slot = slot;
-        req->state = BatchState::PREFILL;
-        batch_touched_since_legacy = true;
-        req->start_time = std::chrono::steady_clock::now();
 
-        ApplyPromptFormatAdjustments(req->prompt_added_memory, req->prompt);
-        std::vector<llama_token> added_memory_tokens; //temporary buf before copying over
-
-        TokenizeString(req->prompt, req->prompt_tokens, file_format, add_bos_token);
-        if(req->prompt_tokens.empty())
+        //pick a free slot: longest cached prefix first, else least recently used
+        int best = -1;
+        int best_prefix = -1;
+        for(int i = 0; i < (int) batch_slots.size(); ++i)
         {
-            TokenizeString("", req->prompt_tokens, file_format, add_bos_token);
-        }
-        if(req->prompt_added_memory!="")
-        {
-            TokenizeString(req->prompt_added_memory, added_memory_tokens, file_format, add_bos_token);
-        }
-
-        int n_ctx = req->max_context_length > 0 ? std::min(req->max_context_length, kcpp_data->n_ctx) : kcpp_data->n_ctx;
-        AppendDedicatedMemoryAndNegativePrompt(req->prompt_tokens, added_memory_tokens, std::vector<llama_token>(), req->max_length, n_ctx);
-
-        if(req->max_length > 0 && (int) req->prompt_tokens.size() + req->max_length > n_ctx)
-        {
-            int keep = std::max(1, n_ctx - req->max_length);
-            if((int) req->prompt_tokens.size() > keep)
+            const BatchSlot & slot = batch_slots[i];
+            if(slot.request_id >= 0)
             {
-                req->prompt_tokens.erase(req->prompt_tokens.begin(), req->prompt_tokens.end() - keep);
+                continue;
+            }
+            int prefix = (batch_fastforward ? batch_common_prefix(slot.cache_tokens, req->prompt_tokens) : 0);
+            if(best < 0 || prefix > best_prefix || (prefix == best_prefix && slot.last_used < batch_slots[best].last_used))
+            {
+                best = i;
+                best_prefix = prefix;
+            }
+        }
+        if(best < 0)
+        {
+            break;
+        }
+
+        //capacity: reservations of live requests plus cached cells kept for reuse
+        const int reserved = batch_reserved_cells_locked();
+        const int legacy_cells = batch_seq_pos_count(llama_ctx_v4, 0);
+        int cached = batch_cached_cells_locked() + legacy_cells;
+        if(reserved + req->reserve + cached > pool)
+        {
+            //evict idle caches (serial-lane sequence first, then least recently used slots)
+            if(legacy_cells > 0)
+            {
+                batch_clear_legacy_sequence_locked();
+                cached -= legacy_cells;
+            }
+            while(reserved + req->reserve + cached > pool)
+            {
+                int victim = -1;
+                for(int i = 0; i < (int) batch_slots.size(); ++i)
+                {
+                    const BatchSlot & slot = batch_slots[i];
+                    if(slot.request_id >= 0 || slot.cache_tokens.empty() || i == best)
+                    {
+                        continue;
+                    }
+                    if(victim < 0 || slot.last_used < batch_slots[victim].last_used)
+                    {
+                        victim = i;
+                    }
+                }
+                if(victim < 0)
+                {
+                    break;
+                }
+                cached -= (int) batch_slots[victim].cache_tokens.size();
+                batch_seq_clear(batch_slots[victim].seq);
+                batch_slots[victim].cache_tokens.clear();
+            }
+            if(reserved + req->reserve + cached > pool && !batch_slots[best].cache_tokens.empty())
+            {
+                cached -= (int) batch_slots[best].cache_tokens.size();
+                batch_seq_clear(batch_slots[best].seq);
+                batch_slots[best].cache_tokens.clear();
+                best_prefix = 0;
+            }
+            if(reserved + req->reserve + cached > pool)
+            {
+                break; //head of queue waits for live requests to finish (FIFO, no overtaking)
             }
         }
 
-        if (debugmode==1 && !is_quiet)
-        {
-            std::string outstr = "";
-            printf("\n\n[Debug: Dump %zu Raw Input Tokens]\n",req->prompt_tokens.size());
-            outstr += get_tok_vec_str(req->prompt_tokens);
-            printf("%s\n", RemoveBell(outstr).c_str());
-        }
+        batch_waiting.pop_front();
+        BatchSlot & slot = batch_slots[best];
+        slot.request_id = req->id;
+        slot.last_used = ++batch_use_counter;
+        req->slot = best;
+        req->state = BatchState::PREFILL;
+        req->start_time = std::chrono::steady_clock::now();
+        req->queue_time = std::chrono::duration<float>(req->start_time - req->submit_time).count();
 
-        req->prompt_token_count = req->prompt_tokens.size();
-        req->sampler = batch_build_sampler(*req);
-        for(llama_token token : req->prompt_tokens)
+        //prefix reuse: keep the cached prefix, but always re-evaluate at least the last prompt token
+        int reuse = std::min(best_prefix, req->n_prompt - 1);
+        if(reuse > 0 && !batch_seq_keep(slot.seq, reuse))
         {
-            llama_sampler_accept(req->sampler, token);
+            reuse = 0;
         }
-        req->prompt_pos = 0;
-        req->n_past = 0;
+        if(reuse <= 0)
+        {
+            reuse = 0;
+            batch_seq_clear(slot.seq);
+        }
+        slot.cache_tokens.clear();
+        req->n_reused = reuse;
+        req->prompt_pos = reuse;
+        req->n_past = reuse;
+        req->kv_tokens.assign(req->prompt_tokens.begin(), req->prompt_tokens.begin() + reuse);
         req->has_pending = false;
-        req->i_batch = -1;
-        req->i_batch_is_prefill = false;
-        llama_memory_seq_rm(llama_get_memory(llama_ctx_v4), slot, -1, -1);
-        req->process_start_time = std::chrono::steady_clock::now();
-        req->generation_start_time = std::chrono::steady_clock::time_point();
-        req->init_time = std::chrono::duration<float>(req->process_start_time - req->start_time).count();
-        req->process_time = 0.0f;
+        req->draft.clear();
+        batch_totals.reused_tokens += reuse;
         claimed = true;
+
+        int live = 0;
+        for(const auto & r : batch_requests)
+        {
+            if(r && batch_is_live_state(r->state))
+            {
+                ++live;
+            }
+        }
+        batch_totals.peak_live = std::max(batch_totals.peak_live, live);
     }
     return claimed;
 }
+
+//target decode followed by the speculative state update (llama.cpp v0.5.0 server order)
+static int32_t batch_decode(llama_batch & batch)
+{
+    if(batch_spec_enabled && draft_ctx && batch_spec_dft_rollback)
+    {
+        int last_seq = -1;
+        for(int i = 0; i < batch.n_tokens; ++i)
+        {
+            const int s = batch.seq_id[i][0];
+            if(s != last_seq)
+            {
+                llama_memory_seq_rm(llama_get_memory(draft_ctx), s, batch.pos[i], -1);
+                last_seq = s;
+            }
+        }
+    }
+    const int32_t status = llama_decode(llama_ctx_v4, batch);
+    batch_totals.decode_calls++;
+    if(status == 0 && batch_spec_enabled && draft_spec)
+    {
+        if(!common_speculative_process(draft_spec, batch))
+        {
+            return -100;
+        }
+    }
+    return status;
+}
+
+struct BatchStepOutcome
+{
+    BatchGenerateRequest * req = nullptr;
+    std::vector<std::string> pieces;
+    std::string text;
+    int n_emitted = 0;
+    int n_draft = 0;
+    int n_accepted = 0;
+    bool from_prefill = false;
+    bool finished = false;
+    stop_reason reason = stop_reason::INVALID;
+    std::string error;
+};
 
 static void batch_worker_loop()
 {
     const int batch_cap = std::max(1, kcpp_data ? kcpp_data->n_batch : 512);
     llama_batch batch = llama_batch_init(batch_cap, 0, 1);
+    std::vector<BatchGenerateRequest *> live;
+    std::vector<BatchStepOutcome> outcomes;
     while(true)
     {
-        std::vector<int> decode_ids;
+        live.clear();
         {
             std::unique_lock<std::mutex> lock(batch_mutex);
-            batch_cv.wait_for(lock, std::chrono::milliseconds(5), [](){
-                return batch_worker_stop || (!batch_legacy_active && batch_has_live_locked());
+            batch_cv.wait_for(lock, std::chrono::milliseconds(50), [](){
+                return batch_worker_stop || (!batch_legacy_active && (batch_has_live_locked() || (batch_legacy_waiting == 0 && !batch_waiting.empty())));
             });
             if(batch_worker_stop)
             {
@@ -4865,118 +5457,307 @@ static void batch_worker_loop()
             {
                 continue;
             }
-            batch_claim_waiting_locked();
-            common_batch_clear(batch);
             for(auto & req_ptr : batch_requests)
             {
-                if(!req_ptr || !batch_is_live_state(req_ptr->state) || req_ptr->slot < 0 || batch.n_tokens >= batch_cap)
+                if(req_ptr && batch_is_live_state(req_ptr->state) && req_ptr->abort_requested)
                 {
-                    continue;
-                }
-                BatchGenerateRequest & req = *req_ptr;
-                req.i_batch = -1;
-                req.i_batch_is_prefill = false;
-                if(req.abort_requested)
-                {
-                    batch_finish_request_locked(req, stop_reason::INVALID);
-                    continue;
-                }
-                if(req.state == BatchState::PREFILL)
-                {
-                    while(req.prompt_pos < (int) req.prompt_tokens.size() && batch.n_tokens < batch_cap)
-                    {
-                        bool is_last = req.prompt_pos == (int) req.prompt_tokens.size() - 1;
-                        if(is_last)
-                        {
-                            req.i_batch = batch.n_tokens;
-                            req.i_batch_is_prefill = true;
-                        }
-                        common_batch_add(batch, req.prompt_tokens[req.prompt_pos], req.n_past, { req.slot }, is_last);
-                        req.prompt_pos++;
-                        req.n_past++;
-                    }
-                    if(req.prompt_pos == (int) req.prompt_tokens.size())
-                    {
-                        req.state = BatchState::GENERATING;
-                    }
-                }
-                else if(req.state == BatchState::GENERATING && req.has_pending)
-                {
-                    req.i_batch = batch.n_tokens;
-                    req.i_batch_is_prefill = false;
-                    common_batch_add(batch, req.pending_token, req.n_past, { req.slot }, true);
-                    req.n_past++;
-                    req.has_pending = false;
+                    batch_finish_request_locked(*req_ptr, stop_reason::INVALID);
                 }
             }
-            if(batch.n_tokens == 0)
+            if(batch_legacy_waiting == 0)
             {
-                continue;
+                batch_claim_waiting_locked();
             }
             for(auto & req_ptr : batch_requests)
             {
-                if(req_ptr && req_ptr->i_batch >= 0)
+                if(req_ptr && batch_is_live_state(req_ptr->state))
                 {
-                    decode_ids.push_back(req_ptr->id);
+                    live.push_back(req_ptr.get());
                 }
             }
         }
+        if(live.empty())
+        {
+            continue;
+        }
 
-        int decode_status = llama_decode(llama_ctx_v4, batch);
-        auto decode_finish_time = std::chrono::steady_clock::now();
+        //drafts for generating sequences (one speculative state per sequence)
+        bool any_draft = false;
+        if(batch_spec_enabled && draft_spec)
+        {
+            for(auto * req : live)
+            {
+                req->draft.clear();
+                if(req->state != BatchState::GENERATING || !req->has_pending)
+                {
+                    continue;
+                }
+                const int remaining = req->max_length - req->n_generated;
+                int n_max = std::min(speculative_chunk_amt, remaining - 1);
+                n_max = std::min(n_max, req->n_ctx_cap - req->n_past - 1);
+                if(n_max <= 0)
+                {
+                    continue;
+                }
+                auto & dp = common_speculative_get_draft_params(draft_spec, batch_slots[req->slot].seq);
+                dp.drafting = true;
+                dp.n_max = n_max;
+                dp.pos0 = req->n_past;
+                dp.id_last = req->pending_token;
+                dp.prompt = &req->kv_tokens;
+                dp.result = &req->draft;
+                any_draft = true;
+            }
+            if(any_draft)
+            {
+                common_speculative_draft(draft_spec);
+            }
+        }
 
-        std::lock_guard<std::mutex> lock(batch_mutex);
+        //build the batch: generation (pending + draft) first, then prompt chunks
+        common_batch_clear(batch);
+        for(auto * req : live)
+        {
+            req->rows.clear();
+            req->in_batch = false;
+        }
+        for(auto * req : live)
+        {
+            if(req->state != BatchState::GENERATING || !req->has_pending)
+            {
+                continue;
+            }
+            const int seq = batch_slots[req->slot].seq;
+            if(batch.n_tokens + 1 + (int) req->draft.size() > batch_cap)
+            {
+                req->draft.clear();
+            }
+            if(batch.n_tokens + 1 > batch_cap)
+            {
+                continue;
+            }
+            req->in_batch = true;
+            req->rows.push_back(batch.n_tokens);
+            common_batch_add(batch, req->pending_token, req->n_past, { seq }, true);
+            for(size_t k = 0; k < req->draft.size(); ++k)
+            {
+                req->rows.push_back(batch.n_tokens);
+                common_batch_add(batch, req->draft[k], req->n_past + 1 + (int) k, { seq }, true);
+            }
+        }
+        for(auto * req : live)
+        {
+            if(req->state != BatchState::PREFILL)
+            {
+                continue;
+            }
+            const int seq = batch_slots[req->slot].seq;
+            while(req->prompt_pos < req->n_prompt && batch.n_tokens < batch_cap)
+            {
+                req->in_batch = true;
+                const bool is_last = (req->prompt_pos == req->n_prompt - 1);
+                if(is_last)
+                {
+                    req->rows.push_back(batch.n_tokens);
+                }
+                //MTP needs hidden states at every prompt position for its draft cache
+                common_batch_add(batch, req->prompt_tokens[req->prompt_pos], req->n_past, { seq }, is_last || batch_spec_enabled);
+                req->kv_tokens.push_back(req->prompt_tokens[req->prompt_pos]);
+                req->prompt_pos++;
+                req->n_past++;
+            }
+        }
+        if(batch.n_tokens == 0)
+        {
+            continue;
+        }
+
+        const int32_t decode_status = batch_decode(batch);
+        const auto decode_finish_time = std::chrono::steady_clock::now();
         if(decode_status != 0)
         {
-            for(int request_id : decode_ids)
+            std::lock_guard<std::mutex> lock(batch_mutex);
+            const std::string err = "llama_decode failed (code " + std::to_string(decode_status) + ")";
+            for(auto * req : live)
             {
-                BatchGenerateRequest * req = batch_find_request_locked(request_id);
-                if(req && batch_is_live_state(req->state))
+                if(req->in_batch && batch_is_live_state(req->state))
                 {
-                    batch_finish_request_locked(*req, stop_reason::ERROR_ENCOUNTERED);
+                    batch_finish_request_locked(*req, stop_reason::ERROR_ENCOUNTERED, err);
                 }
             }
             continue;
         }
 
-        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(llama_ctx_v4));
-        const std::vector<llama_token> eog_tokens = GetEogIDs(file_format,n_vocab);
-        for(int request_id : decode_ids)
+        //sample and verify per request; the worker is the only writer of decode/sampler state
+        outcomes.clear();
+        for(auto * req : live)
         {
-            BatchGenerateRequest * req = batch_find_request_locked(request_id);
-            if(!req || req->state != BatchState::GENERATING || req->i_batch < 0)
+            if(!req->in_batch || req->rows.empty())
             {
-                continue;
+                continue; //not scheduled this step, or prompt chunk in progress
             }
-            if(req->i_batch_is_prefill && req->generation_start_time.time_since_epoch().count() == 0)
+            BatchStepOutcome oc;
+            oc.req = req;
+            oc.from_prefill = (req->state == BatchState::PREFILL);
+            const int seq = batch_slots[req->slot].seq;
+            std::vector<llama_token> sampled;
+            auto is_stop_token = [&](llama_token t) {
+                const bool eog = std::find(req->eog_ids.begin(), req->eog_ids.end(), t) != req->eog_ids.end();
+                const bool special = std::find(req->special_stops.begin(), req->special_stops.end(), t) != req->special_stops.end();
+                return (eog && req->allow_eos_token && !req->bypass_eos_token) || special;
+            };
+            try
             {
-                req->generation_start_time = decode_finish_time;
-                req->process_time = std::chrono::duration<float>(decode_finish_time - req->process_start_time).count();
+                if(oc.from_prefill)
+                {
+                    req->process_time = std::chrono::duration<float>(decode_finish_time - req->start_time).count();
+                    req->generation_start_time = decode_finish_time;
+                    if(batch_spec_enabled && draft_spec)
+                    {
+                        common_speculative_begin(draft_spec, seq, req->kv_tokens);
+                    }
+                    sampled.push_back(batch_sample_token(*req, llama_get_logits_ith(llama_ctx_v4, req->rows[0])));
+                }
+                else
+                {
+                    oc.n_draft = (int) req->draft.size();
+                    for(int k = 0; k <= oc.n_draft; ++k)
+                    {
+                        const llama_token t = batch_sample_token(*req, llama_get_logits_ith(llama_ctx_v4, req->rows[k]));
+                        sampled.push_back(t);
+                        if(is_stop_token(t))
+                        {
+                            break;
+                        }
+                        if(k < oc.n_draft && t == req->draft[k])
+                        {
+                            oc.n_accepted++;
+                            continue;
+                        }
+                        break;
+                    }
+                    //decoded [pending, d0..dn-1]; KV keeps pending plus the accepted draft prefix
+                    req->kv_tokens.push_back(req->pending_token);
+                    for(int k = 0; k < oc.n_accepted; ++k)
+                    {
+                        req->kv_tokens.push_back(req->draft[k]);
+                    }
+                    req->n_past += 1 + oc.n_accepted;
+                    if(oc.n_draft > oc.n_accepted && !batch_seq_keep(seq, req->n_past))
+                    {
+                        oc.finished = true;
+                        oc.reason = stop_reason::ERROR_ENCOUNTERED;
+                        oc.error = "speculative rollback failed (sequence could not be truncated)";
+                    }
+                    if(oc.n_draft > 0)
+                    {
+                        common_speculative_accept(draft_spec, seq, (uint16_t) oc.n_accepted);
+                    }
+                }
             }
-            llama_token sampled = llama_sampler_sample(req->sampler, llama_ctx_v4, req->i_batch);
-            req->completion_token_count++;
-            bool is_eog = std::find(eog_tokens.begin(), eog_tokens.end(), sampled) != eog_tokens.end();
-            if(is_eog && !req->bypass_eos_token)
+            catch(const std::exception & e)
             {
-                batch_finish_request_locked(*req, stop_reason::EOS_TOKEN_HIT);
-                continue;
+                oc.finished = true;
+                oc.reason = stop_reason::ERROR_ENCOUNTERED;
+                oc.error = std::string("sampling failed: ") + e.what();
             }
-            std::string piece = FileFormatTokenizeID(sampled, file_format, req->render_special);
-            req->generated_pieces.push_back(piece);
-            req->output += piece;
-            if(batch_output_hit_stop(*req))
+
+            //emit in order, applying the same stop rules as the serial lane
+            std::string window;
+            if(req->max_stop_len > 0)
             {
-                batch_finish_request_locked(*req, stop_reason::CUSTOM_STOPPER);
-                continue;
+                const size_t keep = std::min(req->output.size(), req->max_stop_len);
+                window = req->output.substr(req->output.size() - keep);
             }
-            if(req->max_length > 0 && req->completion_token_count >= req->max_length)
+            for(size_t j = 0; j < sampled.size() && !oc.finished; ++j)
             {
-                batch_finish_request_locked(*req, stop_reason::OUT_OF_TOKENS);
-                continue;
+                const llama_token t = sampled[j];
+                oc.n_emitted++;
+                const bool eog = std::find(req->eog_ids.begin(), req->eog_ids.end(), t) != req->eog_ids.end();
+                const bool special_stop = std::find(req->special_stops.begin(), req->special_stops.end(), t) != req->special_stops.end();
+                std::string piece = FileFormatTokenizeID(t, file_format, req->render_special);
+                if(!req->render_special && (eog || special_stop))
+                {
+                    piece = "";
+                }
+                oc.pieces.push_back(piece);
+                oc.text += piece;
+                if(!req->bypass_eos_token && req->allow_eos_token && eog)
+                {
+                    oc.finished = true;
+                    oc.reason = stop_reason::EOS_TOKEN_HIT;
+                    break;
+                }
+                if(special_stop)
+                {
+                    oc.finished = true;
+                    oc.reason = stop_reason::EOS_TOKEN_HIT;
+                    break;
+                }
+                if(req->max_stop_len > 0)
+                {
+                    window += piece;
+                    bool hit = false;
+                    for(const auto & stopper : req->stop_sequences)
+                    {
+                        if(!stopper.empty() && window.find(stopper) != std::string::npos)
+                        {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if(hit)
+                    {
+                        oc.finished = true;
+                        oc.reason = stop_reason::CUSTOM_STOPPER;
+                        break;
+                    }
+                    if(window.size() > req->max_stop_len * 4 + 64)
+                    {
+                        window.erase(0, window.size() - req->max_stop_len);
+                    }
+                }
+                if(req->n_generated + oc.n_emitted >= req->max_length)
+                {
+                    oc.finished = true;
+                    oc.reason = stop_reason::OUT_OF_TOKENS;
+                    break;
+                }
             }
-            req->pending_token = sampled;
-            req->has_pending = true;
-            req->i_batch = -1;
+            if(!oc.finished)
+            {
+                req->pending_token = sampled.back();
+                req->has_pending = true;
+            }
+            outcomes.push_back(std::move(oc));
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(batch_mutex);
+            for(auto & oc : outcomes)
+            {
+                BatchGenerateRequest & req = *oc.req;
+                for(auto & p : oc.pieces)
+                {
+                    req.generated_pieces.push_back(std::move(p));
+                }
+                req.output += oc.text;
+                req.n_generated += oc.n_emitted;
+                if(oc.n_draft > 0)
+                {
+                    req.draft_n += oc.n_draft;
+                    req.draft_accepted += std::min(oc.n_accepted, oc.n_emitted);
+                    req.draft_steps++;
+                }
+                if(oc.from_prefill && req.state == BatchState::PREFILL)
+                {
+                    req.state = BatchState::GENERATING;
+                }
+                if(oc.finished)
+                {
+                    batch_finish_request_locked(req, oc.reason, oc.error);
+                }
+            }
         }
     }
     llama_batch_free(batch);
@@ -4996,84 +5777,294 @@ static void batch_start_worker_locked()
 
 bool gpttype_batch_generate_enabled()
 {
-    return continuous_batching_slots > 1 && file_format == FileFormat::GGUF_GENERIC && llama_ctx_v4 && kcpp_data && !draft_ctx && !guidance_ctx;
+    return continuous_batching_slots > 1 && file_format == FileFormat::GGUF_GENERIC && llama_ctx_v4 && kcpp_data && !batch_slots.empty();
 }
 
-int gpttype_batch_generate_submit(const generation_inputs inputs)
+//fills the request's admission fields; returns BATCH_OK or an error code with message
+static int batch_prepare_admission(const generation_inputs & inputs, std::vector<llama_token> & tokens, int & n_ctx_cap, int & reserve, std::string & err)
 {
-    if(!batch_inputs_eligible(inputs))
+    if(!batch_tokenize_request(inputs, tokens, err))
     {
-        return -1;
+        return BATCH_ERR_INVALID;
     }
-    std::lock_guard<std::mutex> lock(batch_mutex);
-    if(batch_legacy_active || batch_legacy_waiting > 0)
+    if(inputs.max_length <= 0)
     {
-        return -1;
+        err = "max_length must be at least 1";
+        return BATCH_ERR_INVALID;
     }
+    n_ctx_cap = batch_request_ctx_cap(inputs);
+    reserve = (int) tokens.size() + inputs.max_length;
+    if(reserve > n_ctx_cap)
+    {
+        err = "request (" + std::to_string(tokens.size()) + " prompt tokens + " + std::to_string(inputs.max_length) +
+              " completion tokens) exceeds the available context size (" + std::to_string(n_ctx_cap) + " tokens)";
+        return BATCH_ERR_CONTEXT;
+    }
+    if(reserve > batch_pool_cells())
+    {
+        err = "request reservation (" + std::to_string(reserve) + " tokens) exceeds the KV pool (" + std::to_string(batch_pool_cells()) + " cells)";
+        return BATCH_ERR_CONTEXT;
+    }
+    return BATCH_OK;
+}
+
+static thread_local std::string batch_submit_message;
+
+batch_submit_outputs gpttype_batch_count_prompt(const generation_inputs inputs)
+{
+    batch_submit_outputs out;
+    batch_submit_message.clear();
+    if(kcpp_data == nullptr || file_format != FileFormat::GGUF_GENERIC || !llama_ctx_v4)
+    {
+        out.error_code = BATCH_ERR_DISABLED;
+        batch_submit_message = "text model is not a GGUF model";
+        out.message = batch_submit_message.c_str();
+        return out;
+    }
+    if(inputs.images_len > 0 || inputs.audio_len > 0)
+    {
+        out.error_code = BATCH_ERR_UNSUPPORTED;
+        batch_submit_message = "token counting for image/audio input is not supported (media token count depends on the projector)";
+        out.message = batch_submit_message.c_str();
+        return out;
+    }
+    std::vector<llama_token> tokens;
+    int n_ctx_cap = 0;
+    int reserve = 0;
+    out.error_code = batch_prepare_admission(inputs, tokens, n_ctx_cap, reserve, batch_submit_message);
+    out.n_prompt_tokens = (int) tokens.size();
+    out.n_ctx = n_ctx_cap;
+    out.reserve = (int) tokens.size() + std::max(0, inputs.max_length);
+    out.message = batch_submit_message.c_str();
+    return out;
+}
+
+batch_submit_outputs gpttype_batch_generate_submit(const generation_inputs inputs)
+{
+    batch_submit_outputs out;
+    batch_submit_message.clear();
+    if(!gpttype_batch_generate_enabled())
+    {
+        out.error_code = BATCH_ERR_DISABLED;
+        batch_submit_message = "parallel requests are not enabled for this model";
+        out.message = batch_submit_message.c_str();
+        return out;
+    }
+    const char * unsupported = batch_unsupported_reason(inputs);
+    if(unsupported)
+    {
+        out.error_code = BATCH_ERR_UNSUPPORTED;
+        batch_submit_message = unsupported;
+        out.message = batch_submit_message.c_str();
+        std::lock_guard<std::mutex> lock(batch_mutex);
+        batch_totals.rejected_unsupported++;
+        return out;
+    }
+
     auto req = std::make_unique<BatchGenerateRequest>();
-    req->id = batch_next_request_id++;
-    req->prompt = inputs.prompt ? inputs.prompt : "";
-    req->prompt_added_memory = inputs.memory ? inputs.memory : "";
-    req->max_context_length = inputs.max_context_length;
+    int code = batch_prepare_admission(inputs, req->prompt_tokens, req->n_ctx_cap, req->reserve, batch_submit_message);
+    out.n_prompt_tokens = (int) req->prompt_tokens.size();
+    out.n_ctx = req->n_ctx_cap;
+    out.reserve = req->reserve;
+    if(code == BATCH_OK)
+    {
+        std::string gerr;
+        req->grammar = batch_parse_grammar(inputs.grammar ? inputs.grammar : "", gerr);
+        if(!gerr.empty())
+        {
+            code = BATCH_ERR_INVALID;
+            batch_submit_message = gerr;
+        }
+    }
+    if(code != BATCH_OK)
+    {
+        out.error_code = code;
+        out.message = batch_submit_message.c_str();
+        if(code == BATCH_ERR_CONTEXT)
+        {
+            std::lock_guard<std::mutex> lock(batch_mutex);
+            batch_totals.rejected_context++;
+        }
+        return out;
+    }
+
+    req->n_prompt = (int) req->prompt_tokens.size();
     req->max_length = inputs.max_length;
-    req->seed = inputs.seed;
+    req->refs = inputs.stream_sse ? 2 : 1;
     req->temperature = inputs.temperature;
-    req->top_k = inputs.top_k;
+    req->top_k = inputs.top_k < 1 ? n_vocab : inputs.top_k;
+    req->top_a = inputs.top_a;
     req->top_p = inputs.top_p;
     req->min_p = inputs.min_p;
     req->typical_p = inputs.typical_p;
+    req->tfs = inputs.tfs;
+    req->nsigma = inputs.nsigma;
     req->rep_pen = inputs.rep_pen;
-    req->rep_pen_slope = inputs.rep_pen_slope;
-    req->rep_pen_range = inputs.rep_pen_range;
+    req->rep_pen_slope = (inputs.rep_pen_slope > 1 || inputs.rep_pen_slope <= 0) ? 1.0f : inputs.rep_pen_slope;
+    req->rep_pen_range = inputs.rep_pen_range < 1 ? 1 : inputs.rep_pen_range;
     req->presence_penalty = inputs.presence_penalty;
+    req->mirostat = inputs.mirostat;
+    req->mirostat_tau = inputs.mirostat_tau;
+    req->mirostat_eta = inputs.mirostat_eta;
+    req->mirostat_mu = 2.0f * inputs.mirostat_tau;
+    req->dry_multiplier = inputs.dry_multiplier;
+    req->dry_base = inputs.dry_base;
+    req->dry_allowed_length = inputs.dry_allowed_length;
+    req->dry_penalty_last_n = inputs.dry_penalty_last_n;
+    req->xtc_threshold = inputs.xtc_threshold;
+    req->xtc_probability = inputs.xtc_probability;
+    req->dynatemp_range = inputs.dynatemp_range;
+    req->dynatemp_exponent = inputs.dynatemp_exponent;
+    req->smoothing_factor = inputs.smoothing_factor;
+    req->smoothing_curve = inputs.smoothing_curve;
+    req->adaptive_target = inputs.adaptive_target;
+    req->adaptive_decay = inputs.adaptive_decay;
+    if(req->adaptive_target > 0.0f && req->adaptive_decay < 1.0f)
+    {
+        req->adaptive_sum = req->adaptive_target / (1.0f - req->adaptive_decay);
+        req->adaptive_weight = 1.0f / (1.0f - req->adaptive_decay);
+    }
+    req->reasoning_budget = inputs.reasoning_budget;
+    if(req->reasoning_budget >= 0)
+    {
+        kcpp_get_thinking_sequences(req->think_start, req->think_end, req->think_phrase);
+    }
+    if(inputs.sampler_len <= 0)
+    {
+        req->sampler_order = { KCPP_SAMPLER_REP_PEN, KCPP_SAMPLER_TOP_K, KCPP_SAMPLER_TOP_A, KCPP_SAMPLER_TFS, KCPP_SAMPLER_TYP, KCPP_SAMPLER_TOP_P, KCPP_SAMPLER_TEMP };
+    }
+    else
+    {
+        for(int i = 0; i < inputs.sampler_len; ++i)
+        {
+            req->sampler_order.push_back(inputs.sampler_order[i]);
+        }
+    }
+    uint32_t seed = (uint32_t) inputs.seed;
+    if(inputs.seed <= 0 || seed == 0xFFFFFFFF)
+    {
+        std::random_device rd;
+        seed = rd() % 1000000u;
+    }
+    req->seed = seed;
+    req->rng.seed(seed);
     req->allow_eos_token = inputs.allow_eos_token;
     req->bypass_eos_token = inputs.bypass_eos_token;
     req->render_special = inputs.render_special;
-    req->logit_biases = {};
+    req->tool_call_fix = inputs.tool_call_fix;
+    req->eog_ids = GetEogIDs(file_format, n_vocab);
     for(int i = 0; i < inputs.logit_biases_len; ++i)
     {
         int32_t t_id = inputs.logit_biases[i].token_id;
         float bias = inputs.logit_biases[i].bias;
-        if(t_id >= 0 && t_id < n_vocab && bias!=0)
+        if(t_id >= 0 && t_id < n_vocab && bias != 0)
         {
-           req->logit_biases.push_back({t_id, bias});
-        }
-    }
-    if(!req->allow_eos_token && !req->bypass_eos_token) //eos token bans
-    {
-        const std::vector<llama_token> eog_tokens = GetEogIDs(file_format,n_vocab);
-        for(int x = 0; x < eog_tokens.size(); ++x)
-        {
-            req->logit_biases.push_back({eog_tokens[x], -999.0f});
+            req->logit_biases.push_back(inputs.logit_biases[i]);
         }
     }
     for(int i = 0; i < inputs.stop_sequence_len; ++i)
     {
-        if(inputs.stop_sequence[i])
+        std::string stopper = inputs.stop_sequence[i] ? inputs.stop_sequence[i] : "";
+        if(stopper == "")
         {
-            req->stop_sequences.emplace_back(inputs.stop_sequence[i]);
+            continue;
+        }
+        req->stop_sequences.push_back(stopper);
+        req->max_stop_len = std::max(req->max_stop_len, stopper.size());
+        std::vector<int> tmp;
+        TokenizeString(stopper, tmp, file_format, false);
+        if(tmp.size() == 1 && FileFormatTokenizeID(tmp[0], file_format) == "")
+        {
+            req->special_stops.push_back(tmp[0]);
         }
     }
-    int request_id = req->id;
+    std::vector<std::string> banned_words;
+    for(int x = 0; x < inputs.banned_tokens_len; ++x)
+    {
+        std::string word = toLowerCase(inputs.banned_tokens[x] ? inputs.banned_tokens[x] : "");
+        if(word != "")
+        {
+            banned_words.push_back(word);
+        }
+    }
+    if(!banned_words.empty() || req->tool_call_fix)
+    {
+        for(int v = 0; v < n_vocab; ++v)
+        {
+            const std::string word = toLowerCase(FileFormatTokenizeID(v, file_format, true));
+            for(const auto & b : banned_words)
+            {
+                if(word.find(b) != std::string::npos)
+                {
+                    req->banned_token_ids.push_back(v);
+                    break;
+                }
+            }
+            if(req->tool_call_fix && word.find(']') != std::string::npos)
+            {
+                req->toolcall_prevented.push_back(v);
+            }
+        }
+    }
+    if(req->dry_multiplier > 0)
+    {
+        const int MAX_CHAR_LEN = 40;
+        const int MAX_SEQ_LEN = 20;
+        for(int x = 0; x < inputs.dry_sequence_breakers_len; ++x)
+        {
+            std::string sequence_break = inputs.dry_sequence_breakers[x] ? inputs.dry_sequence_breakers[x] : "";
+            if(sequence_break == "")
+            {
+                continue;
+            }
+            if(sequence_break.size() > MAX_CHAR_LEN)
+            {
+                sequence_break.resize(MAX_CHAR_LEN);
+            }
+            GetOverlappingTokenSequences(sequence_break, req->dry_breakers, MAX_SEQ_LEN);
+        }
+    }
+    //sampler history starts from the request's own prompt (no cross-request carryover)
+    const int hist = req->rep_pen_range;
+    req->last_n_tokens.assign(hist, 0);
+    {
+        const int n_copy = std::min(hist, (int) req->prompt_tokens.size());
+        std::copy(req->prompt_tokens.end() - n_copy, req->prompt_tokens.end(), req->last_n_tokens.end() - n_copy);
+    }
+    req->context_tokens.assign(req->prompt_tokens.begin(), req->prompt_tokens.end());
+
+    std::lock_guard<std::mutex> lock(batch_mutex);
+    if(batch_legacy_active || batch_legacy_waiting > 0)
+    {
+        //queue behind the serial lane instead of failing: FIFO admission resumes when it finishes
+    }
+    req->id = batch_next_request_id++;
+    req->submit_time = std::chrono::steady_clock::now();
+    batch_totals.submitted++;
+    batch_totals.prompt_tokens += req->n_prompt;
+    const int request_id = req->id;
     batch_requests.emplace_back(std::move(req));
     batch_waiting.push_back(request_id);
     batch_start_worker_locked();
     batch_cv.notify_all();
-    return request_id;
+    out.error_code = BATCH_OK;
+    out.request_id = request_id;
+    out.message = batch_submit_message.c_str();
+    return out;
 }
 
 bool gpttype_batch_generate_has_finished(int request_id)
 {
     std::lock_guard<std::mutex> lock(batch_mutex);
     BatchGenerateRequest * req = batch_find_request_locked(request_id);
-    return !req || !batch_is_live_state(req->state);
+    return !req || !batch_is_pending_state(req->state);
 }
 
 int gpttype_batch_generate_stream_count(int request_id)
 {
     std::lock_guard<std::mutex> lock(batch_mutex);
     BatchGenerateRequest * req = batch_find_request_locked(request_id);
-    return req ? req->generated_pieces.size() : 0;
+    return req ? (int) req->generated_pieces.size() : 0;
 }
 
 const char * gpttype_batch_generate_new_token(int request_id, int idx)
@@ -5108,7 +6099,7 @@ generation_outputs gpttype_batch_generate_result(int request_id)
     std::unique_lock<std::mutex> lock(batch_mutex);
     batch_cv.wait(lock, [request_id](){
         BatchGenerateRequest * req = batch_find_request_locked(request_id);
-        return !req || !batch_is_live_state(req->state);
+        return !req || !batch_is_pending_state(req->state);
     });
     BatchGenerateRequest * req = batch_find_request_locked(request_id);
     if(!req)
@@ -5127,15 +6118,41 @@ generation_outputs gpttype_batch_generate_result(int request_id)
     return output;
 }
 
+const char * gpttype_batch_generate_error(int request_id)
+{
+    static thread_local std::string reader_copy;
+    std::lock_guard<std::mutex> lock(batch_mutex);
+    BatchGenerateRequest * req = batch_find_request_locked(request_id);
+    reader_copy = req ? req->error : "";
+    return reader_copy.c_str();
+}
+
+const std::vector<TopPicksData> gpttype_batch_generate_top_picks(int request_id)
+{
+    std::lock_guard<std::mutex> lock(batch_mutex);
+    BatchGenerateRequest * req = batch_find_request_locked(request_id);
+    if(!req || batch_is_pending_state(req->state))
+    {
+        return std::vector<TopPicksData>();
+    }
+    return req->top_picks;
+}
+
+//cancels only this request: waiting requests leave the queue, live ones are reaped by the worker
 bool gpttype_batch_generate_abort(int request_id)
 {
     std::lock_guard<std::mutex> lock(batch_mutex);
     BatchGenerateRequest * req = batch_find_request_locked(request_id);
-    if(!req)
+    if(!req || !batch_is_pending_state(req->state))
     {
         return false;
     }
     req->abort_requested = true;
+    if(req->state == BatchState::WAITING)
+    {
+        batch_waiting.erase(std::remove(batch_waiting.begin(), batch_waiting.end(), request_id), batch_waiting.end());
+        batch_finish_request_locked(*req, stop_reason::INVALID);
+    }
     batch_cv.notify_all();
     return true;
 }
@@ -5143,10 +6160,135 @@ bool gpttype_batch_generate_abort(int request_id)
 void gpttype_batch_generate_release(int request_id)
 {
     std::lock_guard<std::mutex> lock(batch_mutex);
-    batch_requests.erase(std::remove_if(batch_requests.begin(), batch_requests.end(), [request_id](const std::unique_ptr<BatchGenerateRequest> & req){
-        return req && req->id == request_id && !batch_is_live_state(req->state);
+    BatchGenerateRequest * req = batch_find_request_locked(request_id);
+    if(!req)
+    {
+        return;
+    }
+    req->refs = std::max(0, req->refs - 1);
+    if(req->refs == 0 && batch_is_pending_state(req->state))
+    {
+        //all consumers left: cancel instead of generating into the void
+        req->abort_requested = true;
+        if(req->state == BatchState::WAITING)
+        {
+            batch_waiting.erase(std::remove(batch_waiting.begin(), batch_waiting.end(), request_id), batch_waiting.end());
+            batch_finish_request_locked(*req, stop_reason::INVALID);
+        }
+    }
+    batch_requests.erase(std::remove_if(batch_requests.begin(), batch_requests.end(), [](const std::unique_ptr<BatchGenerateRequest> & r){
+        return r && r->refs == 0 && !batch_is_pending_state(r->state);
     }), batch_requests.end());
     batch_cv.notify_all();
+}
+
+static void batch_init_slots(int slots)
+{
+    std::lock_guard<std::mutex> lock(batch_mutex);
+    batch_slots.clear();
+    for(int i = 0; i < slots; ++i)
+    {
+        BatchSlot s;
+        s.seq = i + 1; //sequence 0 belongs to the serial lane
+        batch_slots.push_back(s);
+    }
+}
+
+std::string gpttype_runtime_status()
+{
+    nlohmann::json j;
+    {
+        std::lock_guard<std::mutex> lock(batch_mutex);
+        nlohmann::json par;
+        par["enabled"] = gpttype_batch_generate_enabled();
+        par["slots"] = (int) batch_slots.size();
+        par["n_seq_max"] = llama_ctx_v4 ? (int) llama_n_seq_max(llama_ctx_v4) : 0;
+        par["n_ctx_seq"] = llama_ctx_v4 ? (int) llama_n_ctx_seq(llama_ctx_v4) : 0;
+        par["pool_cells"] = batch_pool_cells();
+        par["reserved_cells"] = batch_reserved_cells_locked();
+        par["cached_cells"] = batch_cached_cells_locked();
+        par["serial_lane_cells"] = batch_seq_pos_count(llama_ctx_v4, 0);
+        par["serial_lane_active"] = batch_legacy_active;
+        par["serial_lane_waiting"] = batch_legacy_waiting;
+        par["fastforward"] = batch_fastforward;
+        par["target_seq_rm"] = kcpp_seq_rm_name(batch_tgt_seq_rm);
+        par["waiting"] = (int) batch_waiting.size();
+        int live = 0;
+        for(const auto & r : batch_requests)
+        {
+            if(r && batch_is_live_state(r->state))
+            {
+                ++live;
+            }
+        }
+        par["live"] = live;
+        par["totals"] = {
+            {"submitted", batch_totals.submitted},
+            {"completed", batch_totals.completed},
+            {"aborted", batch_totals.aborted},
+            {"failed", batch_totals.failed},
+            {"rejected_context", batch_totals.rejected_context},
+            {"rejected_unsupported", batch_totals.rejected_unsupported},
+            {"prompt_tokens", batch_totals.prompt_tokens},
+            {"reused_tokens", batch_totals.reused_tokens},
+            {"completion_tokens", batch_totals.completion_tokens},
+            {"draft_tokens", batch_totals.draft_tokens},
+            {"draft_accepted", batch_totals.draft_accepted},
+            {"decode_calls", batch_totals.decode_calls},
+            {"peak_live", batch_totals.peak_live},
+        };
+        nlohmann::json slot_list = nlohmann::json::array();
+        for(int i = 0; i < (int) batch_slots.size(); ++i)
+        {
+            const BatchSlot & slot = batch_slots[i];
+            nlohmann::json s;
+            s["id"] = i;
+            s["seq_id"] = slot.seq;
+            s["n_ctx"] = llama_ctx_v4 ? (int) llama_n_ctx_seq(llama_ctx_v4) : 0;
+            s["kv_cells"] = batch_seq_pos_count(llama_ctx_v4, slot.seq);
+            s["cached_tokens"] = (int) slot.cache_tokens.size();
+            BatchGenerateRequest * req = slot.request_id >= 0 ? batch_find_request_locked(slot.request_id) : nullptr;
+            s["is_processing"] = req != nullptr;
+            s["id_task"] = req ? req->id : -1;
+            if(req)
+            {
+                s["state"] = req->state == BatchState::PREFILL ? "prefill" : "generating";
+                s["n_prompt_tokens"] = req->n_prompt;
+                s["n_prompt_tokens_reused"] = req->n_reused;
+                s["n_past"] = req->n_past;
+                s["n_decoded"] = req->n_generated;
+                s["n_remain"] = req->max_length - req->n_generated;
+                s["reserve"] = req->reserve;
+                s["draft_n"] = req->draft_n;
+                s["draft_n_accepted"] = req->draft_accepted;
+            }
+            else
+            {
+                s["state"] = "idle";
+            }
+            slot_list.push_back(s);
+        }
+        par["slot_list"] = slot_list;
+        j["parallel"] = par;
+    }
+    nlohmann::json mtp;
+    mtp["requested"] = mtp_requested;
+    mtp["active"] = (draft_spec != nullptr && draft_is_mtp && draft_spec_type_active == COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    mtp["speculative_type"] = draft_spec ? common_speculative_type_to_str(draft_spec_type_active) : "none";
+    mtp["n_draft_max"] = draft_spec ? speculative_chunk_amt : 0;
+    mtp["serial_lane"] = draft_spec != nullptr;
+    mtp["parallel_lane"] = batch_spec_enabled;
+    mtp["checkpoint_rollback"] = mtp_uses_spec_checkpoint;
+    mtp["n_rs_seq"] = llama_ctx_v4 ? (int) llama_n_rs_seq(llama_ctx_v4) : 0;
+    mtp["status"] = mtp_status_reason;
+    j["mtp"] = mtp;
+    j["context"] = kcpp_context_profile;
+    j["serial_last"] = {
+        {"draft_tokens", last_draft_total},
+        {"draft_accepted", last_draft_success},
+        {"draft_failed", last_draft_failed},
+    };
+    return j.dump();
 }
 
 std::string gpttype_get_chat_template()
@@ -6738,6 +7880,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     bool draft_used = false;
     int draft_successes = 0;
     int draft_failures = 0;
+    int draft_total_tokens = 0; //drafted tokens sent for verification (upstream draft_n)
     int real_n_processed = 0;
 
     init_time = timer_check();
@@ -6916,6 +8059,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     draft_used = true;
                     draft_results = speculative_decoding_eval_chunk(llama_ctx_v4, embd, n_past);
                     evalres = draft_results.draft_success;
+                    draft_total_tokens += (evalres ? draft_results.drafted_amount : 0);
                     if(debugmode==1 && !is_quiet)
                     {
                         if(!evalres)
@@ -7689,6 +8833,9 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     last_seed = kcpp_data->seed;
     last_draft_failed = draft_failures;
     last_draft_success = draft_successes;
+    last_draft_total = draft_total_tokens;
+    output.draft_tokens = draft_total_tokens;
+    output.draft_accepted = draft_successes;
     total_gens += 1;
     concat_output_mtx.lock();
     concat_output_reader_copy_res = concat_output;

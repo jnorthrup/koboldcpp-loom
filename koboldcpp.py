@@ -365,7 +365,13 @@ class load_model_inputs(ctypes.Structure):
                 ("continuous_batching_slots", ctypes.c_int),
                 ("rpc_mode", ctypes.c_int),
                 ("rpc_targets", ctypes.c_char_p),
-                ("loomcache", ctypes.c_bool)]
+                ("loomcache", ctypes.c_bool),
+                ("rope_scaling_type", ctypes.c_int),
+                ("yarn_orig_ctx", ctypes.c_int),
+                ("yarn_ext_factor", ctypes.c_float),
+                ("yarn_attn_factor", ctypes.c_float),
+                ("yarn_beta_fast", ctypes.c_float),
+                ("yarn_beta_slow", ctypes.c_float)]
 
 class generation_inputs(ctypes.Structure):
     _fields_ = [("seed", ctypes.c_int),
@@ -430,7 +436,17 @@ class generation_outputs(ctypes.Structure):
                 ("stopreason", ctypes.c_int),
                 ("prompt_tokens", ctypes.c_int),
                 ("completion_tokens", ctypes.c_int),
-                ("text", ctypes.c_char_p)]
+                ("text", ctypes.c_char_p),
+                ("draft_tokens", ctypes.c_int),
+                ("draft_accepted", ctypes.c_int)]
+
+class batch_submit_outputs(ctypes.Structure):
+    _fields_ = [("request_id", ctypes.c_int),
+                ("error_code", ctypes.c_int),
+                ("n_prompt_tokens", ctypes.c_int),
+                ("n_ctx", ctypes.c_int),
+                ("reserve", ctypes.c_int),
+                ("message", ctypes.c_char_p)]
 
 class sd_load_model_inputs(ctypes.Structure):
     _fields_ = [("model_filename", ctypes.c_char_p),
@@ -1004,7 +1020,14 @@ def init_library():
     handle.has_finished.restype = ctypes.c_bool
     handle.batch_generate_enabled.restype = ctypes.c_bool
     handle.batch_generate_submit.argtypes = [generation_inputs]
-    handle.batch_generate_submit.restype = ctypes.c_int
+    handle.batch_generate_submit.restype = batch_submit_outputs
+    handle.batch_count_prompt.argtypes = [generation_inputs]
+    handle.batch_count_prompt.restype = batch_submit_outputs
+    handle.batch_generate_error.argtypes = [ctypes.c_int]
+    handle.batch_generate_error.restype = ctypes.c_char_p
+    handle.batch_last_logprobs.argtypes = [ctypes.c_int]
+    handle.batch_last_logprobs.restype = last_logprobs_outputs
+    handle.get_runtime_status.restype = ctypes.c_char_p
     handle.batch_generate_has_finished.argtypes = [ctypes.c_int]
     handle.batch_generate_has_finished.restype = ctypes.c_bool
     handle.batch_generate_stream_count.argtypes = [ctypes.c_int]
@@ -1028,6 +1051,7 @@ def init_library():
     handle.get_last_seed.restype = ctypes.c_int
     handle.get_last_draft_success.restype = ctypes.c_int
     handle.get_last_draft_failed.restype = ctypes.c_int
+    handle.get_last_draft_total.restype = ctypes.c_int
     handle.get_total_img_gens.restype = ctypes.c_int
     handle.get_total_tts_gens.restype = ctypes.c_int
     handle.get_total_transcribe_gens.restype = ctypes.c_int
@@ -2144,9 +2168,22 @@ def load_model(model_filename):
     inputs.visionmintokens = vmintk
     inputs.visionmaxtokens = vmaxtk
     inputs.use_smartcontext = args.smartcontext
-    if args.parallelrequests > 1 and not args.noshift:
-        print("\nWarning: Continuous batching is enabled, so context shifting has been disabled automatically.\n")
-        args.noshift = True
+    if args.parallelrequests > 1:
+        # Parallel lane: per-sequence KV with exact admission. Settings that need one shared
+        # sequence (or rewrite it) are rejected instead of silently disabled.
+        conflicts = []
+        if args.smartcontext:
+            conflicts.append("--smartcontext")
+        if args.smartcache:
+            conflicts.append("--smartcache")
+        if getattr(args, "loomcache", False):
+            conflicts.append("--loomcache")
+        if args.draftmodel:
+            conflicts.append("--draftmodel (parallel drafting supports built-in MTP only, use --usemtp)")
+        if not args.noshift:
+            conflicts.append("context shifting (add --noshift: overflowing parallel requests are rejected, not shifted)")
+        if conflicts:
+            exit_with_error(2, "--parallelrequests %d cannot be combined with: %s. Use --parallelrequests 1 for these serial features." % (args.parallelrequests, ", ".join(conflicts)))
     inputs.use_contextshift = (0 if args.noshift else 1)
     inputs.use_fastforward = (0 if args.nofastforward else 1)
     inputs.flash_attention =  (False if args.noflashattention else True)
@@ -2186,6 +2223,16 @@ def load_model(model_filename):
             inputs.rope_freq_base = args.ropeconfig[1]
         else:
             inputs.rope_freq_base = 10000
+
+    ropescaling = str(getattr(args, "ropescaling", "") or "").lower()
+    inputs.rope_scaling_type = {"none": 0, "linear": 1, "yarn": 2}.get(ropescaling, -1)
+    inputs.yarn_orig_ctx = int(getattr(args, "yarnorigctx", 0) or 0)
+    inputs.yarn_ext_factor = float(getattr(args, "yarnextfactor", -1.0))
+    inputs.yarn_attn_factor = float(getattr(args, "yarnattnfactor", -1.0))
+    inputs.yarn_beta_fast = float(getattr(args, "yarnbetafast", -1.0))
+    inputs.yarn_beta_slow = float(getattr(args, "yarnbetaslow", -1.0))
+    if inputs.rope_scaling_type >= 0 and args.overridenativecontext and args.overridenativecontext > 0:
+        exit_with_error(2, "--ropescaling cannot be combined with --overridenativecontext (both define the RoPE adjustment).")
 
     for n in range(tensor_split_max):
         if args.tensor_split and n < len(args.tensor_split):
@@ -2248,8 +2295,10 @@ def coerce_ban_list(value):
             pass
     return [value]
 
-def generate(genparams, stream_flag=False):
-    global maxctx, args, currentusergenkey, totalgens, pendingabortkey
+def prepare_generation_inputs(genparams, stream_flag=False, exact_reservation=False):
+    # Builds the native generation_inputs. With exact_reservation the requested max_length is kept:
+    # the parallel lane reserves prompt + max_length and rejects overflow instead of shrinking the output.
+    global maxctx, args
     default_adapter = {} if chatcompl_adapter is None else chatcompl_adapter
     adapter_obj = genparams.get('adapter', default_adapter)
 
@@ -2346,23 +2395,25 @@ def generate(genparams, stream_flag=False):
             print(f"\n!!! ====== !!!\n(Warning! Request max_context_length={max_context_length} exceeds allocated context size of {maxctx}. It will be reduced to fit. Consider launching with increased --contextsize to avoid issues. This message will only show once per session.)\n!!! ====== !!!")
             showmaxctxwarning = False
         max_context_length = maxctx
-    # Estimate the complete textual input before deciding how much of the
-    # context may be used for output. Media token usage cannot be estimated by
-    # token_count, so retain the more conservative limit for multimodal input.
-    estimated_input_tokens = token_count_text(prompt, True)
-    if estimated_input_tokens >= 0 and memory:
-        memory_token_count = token_count_text(memory, False)
-        estimated_input_tokens = (estimated_input_tokens + memory_token_count) if memory_token_count >= 0 else -1
-    if images or audio:
-        estimated_input_tokens = -1
-    min_remain_hardlimit = calculate_min_remain_hardlimit(max_context_length, estimated_input_tokens)
-    min_remain_softlimit = max(min(max_context_length-4, 16),int(max_context_length*0.45))
     if args.genlimit > 0 and max_length > args.genlimit:
         max_length = args.genlimit
-    if max_length >= (max_context_length-min_remain_softlimit):
-        print(f"\n!!! ====== !!!\nWarning: You are trying to generate text with max_length ({max_length}) near or exceeding max_context_length limit ({max_context_length}).\nMost of the context will be removed, and your outputs will not be very coherent.\nConsider launching with increased --contextsize to avoid issues.\n!!! ====== !!!")
-        if max_length >= (max_context_length-min_remain_hardlimit):
-            max_length = max_context_length-min_remain_hardlimit
+    if not exact_reservation:
+        # Serial lane policy (unchanged): estimate the input and shrink max_length to keep room.
+        # Estimate the complete textual input before deciding how much of the
+        # context may be used for output. Media token usage cannot be estimated by
+        # token_count, so retain the more conservative limit for multimodal input.
+        estimated_input_tokens = token_count_text(prompt, True)
+        if estimated_input_tokens >= 0 and memory:
+            memory_token_count = token_count_text(memory, False)
+            estimated_input_tokens = (estimated_input_tokens + memory_token_count) if memory_token_count >= 0 else -1
+        if images or audio:
+            estimated_input_tokens = -1
+        min_remain_hardlimit = calculate_min_remain_hardlimit(max_context_length, estimated_input_tokens)
+        min_remain_softlimit = max(min(max_context_length-4, 16),int(max_context_length*0.45))
+        if max_length >= (max_context_length-min_remain_softlimit):
+            print(f"\n!!! ====== !!!\nWarning: You are trying to generate text with max_length ({max_length}) near or exceeding max_context_length limit ({max_context_length}).\nMost of the context will be removed, and your outputs will not be very coherent.\nConsider launching with increased --contextsize to avoid issues.\n!!! ====== !!!")
+            if max_length >= (max_context_length-min_remain_hardlimit):
+                max_length = max_context_length-min_remain_hardlimit
 
     reasoning_effort = genparams.get('reasoning_effort', '')
     reasoning_effort = reasoning_effort.strip().lower() if reasoning_effort else ''
@@ -2495,74 +2546,183 @@ def generate(genparams, stream_flag=False):
 
     inputs.reasoning_budget = reasoning_budget
 
+    return inputs, {"genkey": genkey, "trimstop": trimstop, "stop_sequence": stop_sequence}
+
+BATCH_OK = 0
+BATCH_ERR_DISABLED = 1
+BATCH_ERR_UNSUPPORTED = 2
+BATCH_ERR_CONTEXT = 3
+BATCH_ERR_INVALID = 4
+batch_genkey_map = {} # genkey -> parallel request id, for keyed abort/check of parallel requests
+batch_genkey_lock = threading.Lock()
+
+def batch_register_genkey(genkey, request_id):
+    if genkey:
+        with batch_genkey_lock:
+            batch_genkey_map[genkey] = request_id
+
+def batch_unregister_genkey(genkey, request_id):
+    if genkey:
+        with batch_genkey_lock:
+            if batch_genkey_map.get(genkey, -1) == request_id:
+                del batch_genkey_map[genkey]
+
+def batch_lookup_genkey(genkey):
+    if not genkey:
+        return -1
+    with batch_genkey_lock:
+        return batch_genkey_map.get(genkey, -1)
+
+def parallel_lane_enabled():
+    return bool(args and args.parallelrequests and args.parallelrequests > 1 and handle is not None and handle.batch_generate_enabled())
+
+def parallel_submit_error(sub):
+    msg = sub.message.decode("UTF-8","ignore") if sub.message else ""
+    if sub.error_code == BATCH_ERR_CONTEXT:
+        etype, code = "exceed_context_size_error", 400
+    elif sub.error_code == BATCH_ERR_UNSUPPORTED:
+        etype, code = "not_supported_error", 400
+    elif sub.error_code == BATCH_ERR_INVALID:
+        etype, code = "invalid_request_error", 400
+    else:
+        etype, code = "server_error", 500
+    err = {"code": code, "message": msg, "type": etype}
+    if sub.error_code == BATCH_ERR_CONTEXT:
+        err["n_prompt_tokens"] = sub.n_prompt_tokens
+        err["n_ctx"] = sub.n_ctx
+    return code, {"error": err}
+
+def parallel_admit(genparams, stream_flag):
+    # Admits a text request to the parallel lane before any response bytes are sent.
+    # Returns None when admitted (or explicitly routed to the serial lane), else (http_status, error_body).
+    inputs, meta = prepare_generation_inputs(genparams, stream_flag, exact_reservation=True)
+    sub = handle.batch_generate_submit(inputs)
+    if sub.error_code == BATCH_OK:
+        genparams['_batch_request_id'] = sub.request_id
+        genparams['_batch_meta'] = meta
+        batch_register_genkey(meta.get("genkey",""), sub.request_id)
+        return None
+    if sub.error_code == BATCH_ERR_UNSUPPORTED and getattr(args, "parallelserial", False):
+        reason = sub.message.decode("UTF-8","ignore") if sub.message else ""
+        genparams['_serial_lane'] = reason
+        print(f"\n[Parallel] Request routed to the serial lane: {reason}")
+        return None
+    code, body = parallel_submit_error(sub)
+    print(f"\n[Parallel] Request rejected ({body['error']['type']}): {body['error']['message']}")
+    return code, body
+
+def finish_parallel_request(genparams, batch_request_id, stream_flag, genkey):
+    handle.batch_generate_release(batch_request_id)
+    batch_unregister_genkey(genkey, batch_request_id)
+    if not stream_flag:
+        genparams.pop('_batch_request_id', None)
+        genparams.pop('_batch_expected', None)
+        genparams.pop('_batch_fallback', None)
+
+def generate(genparams, stream_flag=False):
+    global currentusergenkey, totalgens, pendingabortkey
+    batch_request_id = genparams.get('_batch_request_id', -1)
+    use_parallel = batch_request_id < 0 and not genparams.get('_serial_lane') and parallel_lane_enabled()
+    inputs = None
+    if batch_request_id >= 0:
+        meta = genparams.get('_batch_meta', {})
+    else:
+        inputs, meta = prepare_generation_inputs(genparams, stream_flag, exact_reservation=use_parallel)
+    genkey = meta.get("genkey", "")
+    trimstop = meta.get("trimstop", True)
+    stop_sequence = meta.get("stop_sequence", [])
+
     currentusergenkey = genkey
     totalgens += 1
     #early exit if aborted
-
     if pendingabortkey!="" and pendingabortkey==genkey:
         print(f"\nDeferred Abort for GenKey: {pendingabortkey}")
         pendingabortkey = ""
-        return {"text":"","status":-1,"stopreason":-1, "prompt_tokens":0, "completion_tokens": 0, "total_tokens": 0}
-    else:
-        batch_request_id = -1
-        if args.parallelrequests > 1:
-            try:
-                batch_request_id = handle.batch_generate_submit(inputs)
-            except Exception:
-                batch_request_id = -1
         if batch_request_id >= 0:
-            genparams['_batch_request_id'] = batch_request_id
-            ret = handle.batch_generate_result(batch_request_id)
-        else:
-            genparams['_batch_fallback'] = True
-            ret = handle.generate(inputs)
-        outstr = ""
-        if ret.status==1:
-            outstr = ret.text.decode("UTF-8","ignore")
-        if batch_request_id >= 0 and not stream_flag:
-            handle.batch_generate_release(batch_request_id)
-            genparams.pop('_batch_request_id', None)
-            genparams.pop('_batch_expected', None)
-            genparams.pop('_batch_fallback', None)
-        if trimstop:
-            for trim_str in stop_sequence:
-                sindex = outstr.find(trim_str)
-                if sindex != -1 and trim_str!="":
-                    outstr = outstr[:sindex]
-        return {"text":outstr,"status":ret.status,"stopreason":ret.stopreason,"prompt_tokens":ret.prompt_tokens, "completion_tokens": ret.completion_tokens}
+            handle.batch_generate_abort(batch_request_id)
+            handle.batch_generate_result(batch_request_id)
+            finish_parallel_request(genparams, batch_request_id, stream_flag, genkey)
+        return {"text":"","status":-1,"stopreason":-1, "prompt_tokens":0, "completion_tokens": 0, "total_tokens": 0}
 
-def continuous_batching_python_eligible(genparams, api_format):
-    if not args.parallelrequests or args.parallelrequests <= 1 or api_format <= 0:
-        return False
-    model_path = str(getattr(args, "model_param", "") or "").lower()
-    if model_path and not model_path.endswith(".gguf"):
-        utfprint("Batching disabled due to file format",2)
-        return False
-    if not getattr(args, "noshift", False) or getattr(args, "smartcontext", False) or getattr(args, "draftmodel", "") or getattr(args, "usemtp", False) or getattr(args, "enableguidance", False):
-        utfprint("Batching disabled due to loaded settings",2)
-        return False
-    if genparams.get("negative_prompt") or genparams.get("images") or genparams.get("audio"):
-        utfprint("Batching disabled due to media",2)
-        return False
-    if genparams.get("grammar") or genparams.get("grammar_retain_state") or genparams.get("banned_tokens") or genparams.get("banned_strings"):
-        utfprint("Batching disabled due to grammar or bans",2)
-        return False
-    if tryparsefloat(genparams.get("dry_multiplier", 0), 0) or tryparseint(genparams.get("mirostat", 0), 0) or tryparsefloat(genparams.get("xtc_probability", 0), 0) or tryparsefloat(genparams.get("nsigma", 0), 0):
-        utfprint("Batching disabled due to samplers set 1",2)
-        return False
-    if tryparsefloat(genparams.get("smoothing_factor", 0), 0) or tryparsefloat(genparams.get("adaptive_target", -1), -1) > 0 or genparams.get("using_openai_tools", False):
-        utfprint("Batching disabled due to samplers set 2",2)
-        return False
-    if tryparsefloat(genparams.get("top_a", 0), 0) or tryparsefloat(genparams.get("tfs", 1), 1) != 1 or tryparsefloat(genparams.get("dynatemp_range", 0), 0):
-        utfprint("Batching disabled due to samplers set 3",2)
-        return False
-    if genparams.get("sampler_order") and genparams.get("sampler_order") != [6, 0, 1, 3, 4, 2, 5]:
-        utfprint("Batching disabled due to sampler order",2)
-        return False
-    if genparams.get("reasoning_effort"):
-        utfprint("Batching disabled due to reasoning",2)
-        return False
-    return True
+    if use_parallel:
+        # internal callers (tool polls, CLI prompt, benchmark) are admitted here
+        sub = handle.batch_generate_submit(inputs)
+        if sub.error_code == BATCH_OK:
+            batch_request_id = sub.request_id
+            genparams['_batch_request_id'] = batch_request_id
+            batch_register_genkey(genkey, batch_request_id)
+        elif sub.error_code == BATCH_ERR_UNSUPPORTED:
+            reason = sub.message.decode("UTF-8","ignore") if sub.message else ""
+            print(f"\n[Parallel] Internal generation uses the serial lane: {reason}")
+            inputs, meta = prepare_generation_inputs(genparams, stream_flag, exact_reservation=False)
+        else:
+            code, body = parallel_submit_error(sub)
+            return {"text":"","status":0,"stopreason":-2,"prompt_tokens":sub.n_prompt_tokens,"completion_tokens":0,"total_tokens":sub.n_prompt_tokens,"error":body["error"],"http_status":code}
+
+    if batch_request_id >= 0:
+        ret = handle.batch_generate_result(batch_request_id)
+        outstr = ret.text.decode("UTF-8","ignore") if (ret.status==1 and ret.text) else ""
+        errmsg = handle.batch_generate_error(batch_request_id)
+        errmsg = errmsg.decode("UTF-8","ignore") if errmsg else ""
+        logprobsdict = None
+        if not stream_flag and genparams.get("logprobs", False):
+            logprobsdict = parse_last_logprobs(handle.batch_last_logprobs(batch_request_id))
+        finish_parallel_request(genparams, batch_request_id, stream_flag, genkey)
+        result = {"text":outstr,"status":ret.status,"stopreason":ret.stopreason,"prompt_tokens":ret.prompt_tokens,"completion_tokens":ret.completion_tokens,"draft_tokens":ret.draft_tokens,"draft_accepted":ret.draft_accepted,"lane":"parallel"}
+        if logprobsdict is not None:
+            result["logprobs_obj"] = logprobsdict
+        if errmsg:
+            result["error_message"] = errmsg
+    else:
+        genparams['_batch_fallback'] = True
+        ret = handle.generate(inputs)
+        outstr = ret.text.decode("UTF-8","ignore") if (ret.status==1 and ret.text) else ""
+        result = {"text":outstr,"status":ret.status,"stopreason":ret.stopreason,"prompt_tokens":ret.prompt_tokens,"completion_tokens":ret.completion_tokens,"draft_tokens":ret.draft_tokens,"draft_accepted":ret.draft_accepted,"lane":"serial"}
+    if trimstop:
+        for trim_str in stop_sequence:
+            sindex = outstr.find(trim_str)
+            if sindex != -1 and trim_str!="":
+                outstr = outstr[:sindex]
+        result["text"] = outstr
+    return result
+
+def count_request_input_tokens(clean_path, body):
+    # Chat-aware exact token count (llama.cpp v0.5.0 input_tokens contract), computed by the engine
+    # on the fully rendered request: same template, memory and BOS handling as generation.
+    genparams = json.loads(body)
+    if not isinstance(genparams, dict):
+        raise ValueError("request body must be a JSON object")
+    if clean_path.endswith('/responses/input_tokens'):
+        fmt = 8
+    elif clean_path.endswith('/messages/count_tokens'):
+        fmt = 9
+    elif clean_path.endswith('/api/extra/admission'):
+        fmt = 4 if genparams.get('messages') else 2
+    else:
+        fmt = 4
+    gendefaults = gendefaults_parse_meta_field(args.gendefaults or '')
+    for k, v in gendefaults.items():
+        if args.gendefaultsoverwrite or k not in genparams:
+            genparams[k] = v
+    use_jinja = args.jinja
+    if use_jinja and not args.jinja_tools and genparams.get('tools'):
+        use_jinja = False
+    genparams['_count_only'] = True # no tool-selection generation while counting
+    genparams = transform_genparams(genparams, fmt, use_jinja)
+    inputs, meta = prepare_generation_inputs(genparams, False, exact_reservation=True)
+    cnt = handle.batch_count_prompt(inputs)
+    if cnt.error_code not in (BATCH_OK, BATCH_ERR_CONTEXT):
+        code, errbody = parallel_submit_error(cnt)
+        return code, json.dumps(errbody).encode()
+    if clean_path.endswith('/api/extra/admission'):
+        res = {"input_tokens": cnt.n_prompt_tokens, "max_tokens": int(inputs.max_length), "reserve": cnt.reserve, "n_ctx": cnt.n_ctx, "admissible": cnt.error_code == BATCH_OK, "lane": ("parallel" if parallel_lane_enabled() else "serial")}
+        if cnt.error_code != BATCH_OK:
+            res["message"] = cnt.message.decode("UTF-8","ignore") if cnt.message else ""
+    else:
+        res = {"input_tokens": cnt.n_prompt_tokens}
+        if fmt in (4, 8):
+            res["object"] = "response.input_tokens"
+    return 200, json.dumps(res).encode()
 
 def sd_get_info():
     info = handle.sd_get_info()
@@ -4528,7 +4688,7 @@ def determine_tool_json_to_use(genparams, curr_ctx, assistant_message_start, is_
 
     if tools_array and len(tools_array) > 0 and chosen_tool is not None and chosen_tool!="none":
         should_use_tools = True
-        if chosen_tool=="auto" or chosen_tool=="required":
+        if (chosen_tool=="auto" or chosen_tool=="required") and not genparams.get('_count_only', False):
             # note: message string already contains the instruct start tag!
             temptoolnames = extract_all_names_from_tool_array(tools_array)
             tempjson = {}
@@ -5736,6 +5896,13 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         finally:
             genparams.pop('_oai_generation_pending', None)
 
+        if genout.get('error'): # explicit admission rejection (e.g. exceed_context_size_error), never truncated
+            genparams['_request_error'] = genout['error']
+            genparams['_request_error_status'] = genout.get('http_status', 400)
+            if api_format in (3, 4):
+                genparams['_oai_generation_error'] = True
+            return {"error": genout['error']}
+
         recvtxt = genout['text']
         if recvtxt is not None and not isinstance(recvtxt, str):
             recvtxt = recvtxt.decode("UTF-8", "ignore") if isinstance(recvtxt, bytes) else str(recvtxt)
@@ -5749,8 +5916,11 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         # grab logprobs if not streaming
         logprobsdict = None
         if not stream_flag and ("logprobs" in genparams and genparams["logprobs"]):
-            lastlogprobs = handle.last_logprobs()
-            logprobsdict = parse_last_logprobs(lastlogprobs)
+            if genout.get('lane') == 'parallel':
+                logprobsdict = genout.get('logprobs_obj')
+            else:
+                lastlogprobs = handle.last_logprobs()
+                logprobsdict = parse_last_logprobs(lastlogprobs)
 
         # flag instance as non-idle for a while
         washordereq = genparams.get('genkey', '').startswith('HORDEREQ_')
@@ -5815,11 +5985,17 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         modelNameToReturn = friendlymodelname
         if autoswapmode and textName is not None:
             modelNameToReturn = textName
+        drafttokens = int(genout.get('draft_tokens', 0) or 0)
+        draftaccepted = int(genout.get('draft_accepted', 0) or 0)
+        usage_full = {"prompt_tokens": prompttokens, "completion_tokens": comptokens, "total_tokens": (prompttokens+comptokens)}
+        if drafttokens > 0:
+            usage_full["completion_tokens_details"] = {"accepted_prediction_tokens": draftaccepted, "rejected_prediction_tokens": max(0, drafttokens-draftaccepted)}
+        timings_obj = {"prompt_n": prompttokens, "predicted_n": comptokens, "draft_n": drafttokens, "draft_n_accepted": draftaccepted}
         if api_format == 1:
             res = {"data": {"seqs": [recvtxt]}}
         elif api_format == 3:
             res = {"id": cmpl_id, "object": "text_completion", "created": int(time.time()), "model": modelNameToReturn,
-                   "usage": {"prompt_tokens": prompttokens, "completion_tokens": comptokens, "total_tokens": (prompttokens+comptokens)},
+                   "usage": usage_full, "timings": timings_obj,
                    "choices": [{"text": recvtxt, "index": 0, "finish_reason": currfinishreason, "logprobs":logprobsdict}]}
         elif api_format == 4: #chat completions
             ccmsg = {"role": "assistant", "content": recvtxt, "tool_calls": tool_calls}
@@ -5828,7 +6004,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             else:
                 ccmsg["content"] = reasoningtxt + (recvtxt if recvtxt else "")
             res = {"id": chatcmpl_id, "object": "chat.completion", "created": int(time.time()), "model": modelNameToReturn,
-                   "usage": {"prompt_tokens": prompttokens, "completion_tokens": comptokens, "total_tokens": (prompttokens+comptokens)},
+                   "usage": usage_full, "timings": timings_obj,
                    "choices": [{"index": 0, "message": ccmsg, "finish_reason": currfinishreason, "logprobs":logprobsdict}]}
         elif api_format == 5:
             res = {"caption": end_trim_to_sentence(recvtxt)}
@@ -5901,7 +6077,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 "usage": {"input_tokens": prompttokens, "output_tokens": comptokens}
             }
         else: #kcpp format
-            res = {"results": [{"text": recvtxt, "tool_calls": tool_calls, "finish_reason": currfinishreason, "logprobs":logprobsdict, "prompt_tokens": prompttokens, "completion_tokens": comptokens}]}
+            res = {"results": [{"text": recvtxt, "tool_calls": tool_calls, "finish_reason": currfinishreason, "logprobs":logprobsdict, "prompt_tokens": prompttokens, "completion_tokens": comptokens, "draft_tokens": drafttokens, "draft_accepted": draftaccepted}]}
 
         try:
             return res
@@ -6008,6 +6184,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         rseq_num = 0
         current_token = 0
         prompttokens = 0
+        spec_draft_n = 0
+        spec_draft_acc = 0
         incomplete_token_buffer = bytearray()
         async_sleep_short = 0.02
         await asyncio.sleep(0.35) #anti race condition, prevent check from overtaking generate
@@ -6038,6 +6216,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                         # The completed generation result will be sent as an error in do_POST.
                         break
                     prompttokens = batch_final_result.prompt_tokens if using_batch_stream else handle.get_last_input_count()
+                    spec_draft_n = batch_final_result.draft_tokens if using_batch_stream else handle.get_last_draft_total()
+                    spec_draft_acc = batch_final_result.draft_accepted if using_batch_stream else handle.get_last_draft_success()
                 tokenStr = ""
                 streamcount = handle.batch_generate_stream_count(batch_request_id) if using_batch_stream else handle.get_stream_count()
                 while current_token < streamcount:
@@ -6263,7 +6443,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                     delta = {'role':delta["role"],'content':''}
                             if api_format == 4:  # if oai chat, set format to expected openai streaming response
                                 if streamDone and ("logprobs" in genparams and genparams["logprobs"]): # this is a hack that sends an extra message containing ALL the logprobs
-                                    lastlogprobs = handle.last_logprobs()
+                                    lastlogprobs = handle.batch_last_logprobs(batch_request_id) if using_batch_stream else handle.last_logprobs()
                                     logprobsdict = parse_last_logprobs(lastlogprobs)
                                     addonstr = json.dumps({"id":chatcmpl_id,"object":"chat.completion.chunk","created":int(time.time()),"model":modelNameToReturn,"choices":[{"index":0,"finish_reason":None,"delta":{'role':'assistant','content':''},"logprobs":logprobsdict}]})
                                     await self.send_oai_sse_event(addonstr)
@@ -6399,6 +6579,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                         strop = genparams.get("stream_options",None)
                         if (strop and strop.get("include_usage",False)):  # Send a final chunk with usage info, only if requested
                             usage_obj = {"prompt_tokens": prompttokens, "completion_tokens": current_token, "total_tokens": (prompttokens + current_token)}
+                            if spec_draft_n > 0:
+                                usage_obj["completion_tokens_details"] = {"accepted_prediction_tokens": spec_draft_acc, "rejected_prediction_tokens": max(0, spec_draft_n - spec_draft_acc)}
                             if api_format == 4:
                                 usage_str = json.dumps({"id":chatcmpl_id,"object":"chat.completion.chunk","created":int(time.time()),"model":modelNameToReturn,"choices":[],"usage":usage_obj})
                             else:
@@ -6932,6 +7114,7 @@ Change Mode<br>
                     "last_seed": lastseed,
                     "last_draft_success": lastdraftsuccess,
                     "last_draft_failed": lastdraftfailed,
+                    "last_draft_total": handle.get_last_draft_total(),
                     "total_gens": totalgens,
                     "stop_reason": stopreason,
                     "total_img_gens": totalimggens,
@@ -7133,7 +7316,7 @@ Change Mode<br>
                 "chat_template": cached_chat_template,
                 "id": 0,
 		        "id_task": -1,
-                "total_slots": 1,
+                "total_slots": (args.parallelrequests if parallel_lane_enabled() else 1),
                 "modalities": {
                     "vision": mmprojOverride or has_vision_support,
                     "audio": has_audio_support
@@ -7149,10 +7332,16 @@ Change Mode<br>
             response_body = (json.dumps(props_obj).encode())
 
         elif clean_path=="/slots":
-            self.send_response(501)
-            self.end_headers(content_type='application/json')
-            self.wfile.write(json.dumps({"error":{"code":501,"message":"This server does not support slots endpoint.","type":"not_supported_error"}}).encode())
-            return
+            if not parallel_lane_enabled():
+                self.send_response(501)
+                self.end_headers(content_type='application/json')
+                self.wfile.write(json.dumps({"error":{"code":501,"message":"Slots are available with --parallelrequests 2 or more.","type":"not_supported_error"}}).encode())
+                return
+            rstatus = json.loads(handle.get_runtime_status().decode("UTF-8","ignore"))
+            response_body = (json.dumps(rstatus.get("parallel", {}).get("slot_list", [])).encode())
+
+        elif clean_path=="/api/extra/runtime":
+            response_body = handle.get_runtime_status() if handle is not None else b"{}"
 
         elif clean_path=="/api" or clean_path=="/docs":
             content_type = 'text/html'
@@ -7301,6 +7490,16 @@ Change Mode<br>
                 response_code = 400
                 response_body = (json.dumps({"value": -1}).encode())
 
+        elif clean_path.endswith('/chat/completions/input_tokens') or clean_path.endswith('/responses/input_tokens') or clean_path.endswith('/messages/count_tokens') or clean_path.endswith('/api/extra/admission'):
+            if not self.secure_endpoint():
+                return
+            try:
+                response_code, response_body = count_request_input_tokens(clean_path, body)
+            except Exception as e:
+                utfprint("Input Token Count - Body Error: " + str(e))
+                response_code = 400
+                response_body = (json.dumps({"error": {"code": 400, "message": str(e), "type": "invalid_request_error"}}).encode())
+
         elif clean_path.endswith('/api/extra/detokenize'):
             if not self.secure_endpoint():
                 return
@@ -7341,7 +7540,12 @@ Change Mode<br>
             except Exception:
                 multiuserkey = ""
                 pass
-            if (multiuserkey=="" and requestsinqueue==0) or (multiuserkey!="" and multiuserkey==currentusergenkey):
+            batch_abort_id = batch_lookup_genkey(multiuserkey)
+            if batch_abort_id >= 0: # parallel request: cancel only this request's sequence
+                ag = handle.batch_generate_abort(batch_abort_id)
+                response_body = (json.dumps({"success": ("true" if ag else "false"), "done":"true"}).encode())
+                print(f"\nParallel Request {batch_abort_id} Aborted")
+            elif (multiuserkey=="" and requestsinqueue==0) or (multiuserkey!="" and multiuserkey==currentusergenkey):
                 ag = handle.abort_generate()
                 time.sleep(0.1) #short delay before replying
                 response_body = (json.dumps({"success": ("true" if ag else "false"), "done":"true"}).encode())
@@ -7364,7 +7568,11 @@ Change Mode<br>
             except Exception:
                 multiuserkey = ""
 
-            if totalgens>0:
+            batch_check_id = batch_lookup_genkey(multiuserkey)
+            if batch_check_id >= 0:
+                pendtxt = handle.batch_generate_pending_output(batch_check_id)
+                pendtxtStr = pendtxt.decode("UTF-8","ignore") if pendtxt else ""
+            elif totalgens>0:
                 if (multiuserkey=="" and multiuserkey==currentusergenkey and requestsinqueue==0) or (multiuserkey!="" and multiuserkey==currentusergenkey): #avoid leaking prompts in multiuser
                     pendtxt = handle.get_pending_output()
                     pendtxtStr = ctypes.string_at(pendtxt).decode("UTF-8","ignore")
@@ -7924,8 +8132,8 @@ Change Mode<br>
                 if args.foreground:
                     bring_terminal_to_foreground()
 
-                #if it's a non-batchable request and we already have batching ongoing, stall this request
-                if batched_request_runner_count > 0 and not continuous_batching_python_eligible(genparams, api_format):
+                #non-text work (image, audio, embeddings) keeps exclusive use of the model with respect to running text batches
+                if api_format <= 0 and batched_request_runner_count > 0:
                     with batched_cond:
                         while batched_request_runner_count > 0:
                             batched_cond.wait()
@@ -7936,12 +8144,30 @@ Change Mode<br>
                         sse_stream_flag = True
                     if (api_format == 6 or api_format == 7) and genparams.get('stream', True):
                         sse_stream_flag = True
-                    if continuous_batching_python_eligible(genparams, api_format):
-                        genparams['_batch_expected'] = True
-                        modelbusy.release()
-                        is_batchable_req = True
-                        with batched_cond:
-                            batched_request_runner_count += 1
+                    if parallel_lane_enabled():
+                        if api_format == 5:
+                            genparams['_serial_lane'] = "interrogate (image captioning) runs on the serial lane"
+                            admit_err = None
+                        else:
+                            admit_err = parallel_admit(genparams, sse_stream_flag)
+                        if admit_err is not None: # explicit rejection, before any response bytes
+                            errcode, errbody = admit_err
+                            errresp = json.dumps(errbody).encode()
+                            self.send_response(errcode)
+                            self.send_header('content-length', str(len(errresp)))
+                            self.end_headers(content_type='application/json')
+                            self.wfile.write(errresp)
+                            return
+                        if genparams.get('_batch_request_id', -1) >= 0:
+                            genparams['_batch_expected'] = True
+                            modelbusy.release()
+                            is_batchable_req = True
+                            with batched_cond:
+                                batched_request_runner_count += 1
+                        else:
+                            with batched_cond: # serial-lane request waits for admitted parallel requests to drain
+                                while batched_request_runner_count > 0:
+                                    batched_cond.wait()
 
                     gendat = asyncio.run(self.handle_request(genparams, api_format, sse_stream_flag))
                     if genparams.pop('_client_disconnected', False):
@@ -7951,7 +8177,7 @@ Change Mode<br>
                         modelNameToReturn = friendlymodelname
                         if autoswapmode and textName is not None:
                             modelNameToReturn = textName
-                        if api_format in (3, 4) and gendat and gendat.get('error'):
+                        if gendat and gendat.get('error') and (api_format in (3, 4) or genparams.get('_request_error')):
                             genresp = json.dumps(gendat).encode()
                             if genparams.get('_sse_stream_started', False):
                                 self.wfile.write(b'data: ' + genresp + b'\n\ndata: [DONE]\n\n')
@@ -7961,7 +8187,7 @@ Change Mode<br>
                                 # Once keepalives start, errors use the same JSON
                                 # body and the already committed HTTP 200 status.
                                 if not genparams.get('_json_keepalive_started', False):
-                                    self.send_response(500)
+                                    self.send_response(genparams.get('_request_error_status', 500))
                                     self.send_header('content-length', str(len(genresp)))
                                     self.end_headers(content_type='application/json')
                                 self.wfile.write(genresp)
@@ -13580,7 +13806,7 @@ if __name__ == '__main__':
     modelgroup.add_argument("--model","-m", metavar=('[filenames]'), help="Model file to load. Accepts multiple values if they are URLs.", type=str, nargs='+', default=[])
     modelgroup.add_argument("model_param", help="Model file to load (positional)", nargs="?")
     parser.add_argument("--config", metavar=('[filename]'), help="Load settings from a .kcpps file. Other arguments will be ignored", type=str, nargs=1)
-    parser.add_argument("--contextsize","--ctx-size", "-c", help=f"Controls the memory allocated for maximum context size, only change if you need more RAM for big contexts. (default {default_maxctx}).",metavar=('[256 to 524288]'), type=check_range(int,256,524288), default=default_maxctx)
+    parser.add_argument("--contextsize","--ctx-size", "-c", help=f"Controls the memory allocated for maximum context size, only change if you need more RAM for big contexts. (default {default_maxctx}).",metavar=('[256 to 1048576]'), type=check_range(int,256,1048576), default=default_maxctx)
     parser.add_argument("--gpulayers","--gpu-layers","--n-gpu-layers","-ngl", help="Set number of layers to offload to GPU (when using GPU). Set to -1 to enable autofit (default), set to 0 to disable GPU offload.",metavar=('[GPU layers]'), nargs='?', const=1, type=int, default=-1)
     parser.add_argument("--host", metavar=('[ipaddr]'), help="Host IP to listen on. If this flag is not set, all routable interfaces are accepted.", default="")
     parser.add_argument("--launch", help="Launches a web browser when load is completed.", action='store_true')
@@ -13653,7 +13879,7 @@ if __name__ == '__main__':
     advparser.add_argument("--overridekv","--override-kv", metavar=('[name=type:value]'), help="Override metadata value by key. Separate multiple values with commas. Format is name=type:value. Types: int, float, bool, str", default="")
     advparser.add_argument("--overridenativecontext", help="Overrides the native trained context of the loaded model with a custom value to be used for Rope scaling.",metavar=('[trained context]'), type=int, default=0)
     advparser.add_argument("--overridetensors","--override-tensor","-ot", metavar=('[tensor name pattern=buffer type]'), help="Override selected backend for specific tensors matching tensor_name_regex_pattern=buffer_type, same as in llama.cpp.", default="")
-    advparser.add_argument("--parallelrequests","--continuous-batching","--contbatch", help="Allows multiple requests to be batched and executed in parallel. Only works for basic text generation requests (Experimental, No media)", metavar=('[slots]'), type=check_range(int,0,32), default=1)
+    advparser.add_argument("--parallelrequests","--continuous-batching","--contbatch", help="Serve up to N text requests concurrently, each with its own KV sequence, sampler state and MTP draft state. Requests are admitted only if prompt + max_length fits the context (overflow returns exceed_context_size_error, never truncated). Image/audio input, CFG, retained grammar and phrase bans are rejected unless --parallelserial routes them to the serial lane. Incompatible with context shift, smartcontext, smartcache and --draftmodel.", metavar=('[slots]'), type=check_range(int,0,32), default=1)
     advparser.add_argument("--password", metavar=('[API key]'), help="Enter a password required to use this instance. This key will be required for all text endpoints. Image endpoints are not secured. Can also be set with env var KCPP_PASSWORD", default=os.getenv('KCPP_PASSWORD',None))
     advparser.add_argument("--preloadstory", metavar=('[savefile]'), help="Configures a prepared story json save file to be hosted on the server, which frontends (such as KoboldAI Lite) can access over the API.", default="")
     advparser.add_argument("--prompt","-p", metavar=('[prompt]'), help="Passing a prompt string triggers a direct inference, loading the model, outputs the response to stdout and exits. Can be used alone or with benchmark.", type=str, default="")
@@ -13663,6 +13889,13 @@ if __name__ == '__main__':
     advparser.add_argument("--reasoningeffort", help="A quick way to set the default reasoning effort. API values override this.", type=str, choices=['default','none','low','medium','high','xhigh'], default="default")
     advparser.add_argument("--remotetunnel", help="Uses Cloudflare to create a remote tunnel, allowing you to access koboldcpp remotely over the internet even behind a firewall.", action='store_true')
     advparser.add_argument("--ropeconfig", help="If set, uses customized RoPE scaling from configured frequency scale and frequency base (e.g. --ropeconfig 0.25 10000). Otherwise, uses NTK-Aware scaling set automatically based on context size. For linear rope, simply set the freq-scale and ignore the freq-base",metavar=('[rope-freq-scale]', '[rope-freq-base]'), default=[0.0, 10000.0], type=float, nargs='+')
+    advparser.add_argument("--ropescaling", help="Explicit llama.cpp RoPE scaling type. 'yarn' or 'linear' scale positions so the model's original context covers --contextsize (YaRN factor = contextsize / original context). Default: model metadata plus KoboldCpp's automatic base adjustment.", type=str.lower, choices=['none','linear','yarn'], default="")
+    advparser.add_argument("--yarnorigctx", help="Original (pre-extension) context for YaRN/linear scaling. Default: model metadata.", type=int, default=0)
+    advparser.add_argument("--yarnextfactor", help="YaRN extrapolation mix factor (negative = derived).", type=float, default=-1.0)
+    advparser.add_argument("--yarnattnfactor", help="YaRN attention magnitude factor (negative = derived).", type=float, default=-1.0)
+    advparser.add_argument("--yarnbetafast", help="YaRN low correction dimension (negative = model default).", type=float, default=-1.0)
+    advparser.add_argument("--yarnbetaslow", help="YaRN high correction dimension (negative = model default).", type=float, default=-1.0)
+    advparser.add_argument("--parallelserial", help="With --parallelrequests, route requests that need serial-only features (image/audio input, CFG, retained grammar, phrase bans) to the serial lane instead of rejecting them. The serial lane waits for running parallel requests to finish.", action='store_true')
     advparser.add_argument("--savedatafile", metavar=('[savefile]'), help="If enabled, creates or opens a persistent database file on the server, that allows users to save and load their data remotely. A new file is created if it does not exist.", default="")
     advparser.add_argument("--singleinstance", help="Allows this KoboldCpp instance to be shut down by any new instance requesting the same port, preventing duplicate servers from clashing on a port.", action='store_true')
     advparser.add_argument("--smartcache", help="Enables intelligent context switching by saving KV cache snapshots to RAM. Requires fast forwarding.", metavar=('limit'), nargs='?', const=1, type=int, default=0)

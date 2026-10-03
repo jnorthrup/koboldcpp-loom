@@ -92,7 +92,11 @@ std::string gpttype_parse_chat_tool_calls(const std::string & generated_text,
                                           bool parallel_tool_calls,
                                           bool is_partial);
 bool gpttype_batch_generate_enabled();
-int gpttype_batch_generate_submit(const generation_inputs inputs);
+batch_submit_outputs gpttype_batch_generate_submit(const generation_inputs inputs);
+batch_submit_outputs gpttype_batch_count_prompt(const generation_inputs inputs);
+const char * gpttype_batch_generate_error(int request_id);
+const std::vector<TopPicksData> gpttype_batch_generate_top_picks(int request_id);
+std::string gpttype_runtime_status();
 bool gpttype_batch_generate_has_finished(int request_id);
 int gpttype_batch_generate_stream_count(int request_id);
 const char * gpttype_batch_generate_new_token(int request_id, int idx);
