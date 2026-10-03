@@ -30,6 +30,7 @@ OUT = os.environ.get("KCPP_TEST_OUT", "") or tempfile.mkdtemp(prefix="kcpp-paral
 CTX = 4096
 SLOTS = 4
 DRAFT = 3
+LONG_N = 1200
 EVIDENCE = {}
 
 
@@ -275,14 +276,14 @@ def test_parallel_engine():
         res = {}
 
         def long_req(key):
-            res[key] = gen(srv, "Write a long story about a lighthouse keeper.", 300, ban_eos_token=True, genkey=key,
+            res[key] = gen(srv, "Write a long story about a lighthouse keeper.", LONG_N, ban_eos_token=True, genkey=key,
                            temperature=0.7, sampler_seed=3)
 
         ta = threading.Thread(target=long_req, args=("KEYA",))
         tb = threading.Thread(target=long_req, args=("KEYB",))
         before = srv.runtime()["parallel"]["totals"]["aborted"]
         ta.start(); tb.start()
-        time.sleep(2.0)
+        time.sleep(1.5)
         st, ab = srv.post("/api/extra/abort", {"genkey": "KEYA"})
         ta.join(); tb.join()
         after = srv.runtime()["parallel"]["totals"]["aborted"]
@@ -291,8 +292,8 @@ def test_parallel_engine():
         ev["cancellation"] = {"abort_response": ab, "a_completion": ra["completion_tokens"], "b_completion": rb["completion_tokens"],
                               "aborted_before": before, "aborted_after": after}
         check("abort targeted A", st == 200 and ab.get("success") == "true", ab)
-        check("A stopped early", ra["completion_tokens"] < 300, ev["cancellation"])
-        check("B unaffected", rb["completion_tokens"] == 300, ev["cancellation"])
+        check("A stopped early", ra["completion_tokens"] < LONG_N, ev["cancellation"])
+        check("B unaffected", rb["completion_tokens"] == LONG_N, ev["cancellation"])
         check("exactly one abort counted", after == before + 1, ev["cancellation"])
 
         # slots endpoint and serial lane after parallel use
@@ -364,7 +365,11 @@ def main():
         except Exception as e:
             failures.append((t.__name__, str(e)))
             print("FAIL", t.__name__, str(e)[:2000])
+    n_checks = len(EVIDENCE.get("checks", []))
+    if n_checks == 0:
+        failures.append(("suite", "no checks executed"))
     EVIDENCE["failures"] = failures
+    print("checks executed: %d, failed tests: %d" % (n_checks, len(failures)))
     path = os.path.join(OUT, "evidence.json")
     with open(path, "w") as f:
         json.dump(EVIDENCE, f, indent=1, default=str)

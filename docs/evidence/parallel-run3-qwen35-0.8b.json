@@ -1,0 +1,180 @@
+{
+ "model": "bartowski/Qwen_Qwen3.5-0.8B-GGUF@f36b1ea4 Qwen_Qwen3.5-0.8B-Q4_K_M.gguf sha256 fb044e93939a70469c905781334f5de1e6c8b608ced6cbc8c9249bd4127d9526",
+ "host": "Apple M3 Pro 36GiB, macOS 15.8.1, Metal, python 3.12.14",
+ "build": "make -j11 LLAMA_METAL=1 KCPP_PARROT=1 koboldcpp_default",
+ "checks": 62,
+ "failed": [],
+ "mtp": {
+  "active": true,
+  "checkpoint_rollback": false,
+  "n_draft_max": 3,
+  "n_rs_seq": 3,
+  "parallel_lane": true,
+  "requested": true,
+  "serial_lane": true,
+  "speculative_type": "draft-mtp",
+  "status": "active (serial and parallel lanes)"
+ },
+ "parallel": {
+  "slots": 4,
+  "n_seq_max": 5,
+  "pool_cells": 4352,
+  "fastforward": false,
+  "target_seq_rm": "rs"
+ },
+ "isolation": {
+  "ZEBRA": {
+   "text": " ZEBRA. The secret word is ZEBRA.",
+   "identical_to_solo": true,
+   "prompt_tokens": 36,
+   "completion_tokens": 12,
+   "draft_tokens": 8,
+   "draft_accepted": 8
+  },
+  "MANGO": {
+   "text": " MANGO. The secret word is MANGO. The secret",
+   "identical_to_solo": true,
+   "prompt_tokens": 32,
+   "completion_tokens": 12,
+   "draft_tokens": 8,
+   "draft_accepted": 8
+  },
+  "VIOLET": {
+   "text": " VIOLET. The secret word is VIOLET.",
+   "identical_to_solo": true,
+   "prompt_tokens": 36,
+   "completion_tokens": 12,
+   "draft_tokens": 8,
+   "draft_accepted": 8
+  },
+  "COPPER": {
+   "text": " COPPER. The secret word is COPPER. The secret",
+   "identical_to_solo": true,
+   "prompt_tokens": 32,
+   "completion_tokens": 12,
+   "draft_tokens": 8,
+   "draft_accepted": 8
+  }
+ },
+ "counters": {
+  "per_request": [
+   {
+    "completion_tokens": 40,
+    "draft_tokens": 29,
+    "draft_accepted": 29
+   },
+   {
+    "completion_tokens": 40,
+    "draft_tokens": 29,
+    "draft_accepted": 29
+   },
+   {
+    "completion_tokens": 40,
+    "draft_tokens": 29,
+    "draft_accepted": 29
+   },
+   {
+    "completion_tokens": 40,
+    "draft_tokens": 29,
+    "draft_accepted": 29
+   }
+  ],
+  "drafted": 116,
+  "accepted": 116
+ },
+ "admission": {
+  "input_tokens": 22,
+  "exact_fit_usage": {
+   "prompt_tokens": 22,
+   "completion_tokens": 2,
+   "total_tokens": 24,
+   "completion_tokens_details": {
+    "accepted_prediction_tokens": 1,
+    "rejected_prediction_tokens": 2
+   }
+  },
+  "one_over": {
+   "error": {
+    "code": 400,
+    "message": "request (22 prompt tokens + 4075 completion tokens) exceeds the available context size (4096 tokens)",
+    "type": "exceed_context_size_error",
+    "n_prompt_tokens": 22,
+    "n_ctx": 4096
+   }
+  },
+  "stream_one_over_status": 400
+ },
+ "overflow": {
+  "long": {
+   "error": {
+    "code": 400,
+    "message": "request (5001 prompt tokens + 8 completion tokens) exceeds the available context size (4096 tokens)",
+    "type": "exceed_context_size_error",
+    "n_prompt_tokens": 5001,
+    "n_ctx": 4096
+   }
+  },
+  "completion_overflow": {
+   "error": {
+    "code": 400,
+    "message": "request (3001 prompt tokens + 2000 completion tokens) exceeds the available context size (4096 tokens)",
+    "type": "exceed_context_size_error",
+    "n_prompt_tokens": 3001,
+    "n_ctx": 4096
+   }
+  },
+  "admitted_prompt_tokens": 3001
+ },
+ "samplers": [
+  "yes",
+  " COPPER. The secret word is COP",
+  "\nA. banana\nB. pear\nC. strawberry\n\n<think>\nThinking Process:\n\n1.  **An",
+  " four five six seven eight nine ten, one two three four five six seven eight"
+ ],
+ "cancellation": {
+  "abort_response": {
+   "success": "true",
+   "done": "true"
+  },
+  "a_completion": 67,
+  "b_completion": 1200,
+  "aborted_before": 0,
+  "aborted_after": 1
+ },
+ "totals_end": {
+  "aborted": 1,
+  "completed": 19,
+  "completion_tokens": 1639,
+  "decode_calls": 500,
+  "draft_accepted": 1057,
+  "draft_tokens": 1668,
+  "failed": 0,
+  "peak_live": 4,
+  "prompt_tokens": 3499,
+  "rejected_context": 4,
+  "rejected_unsupported": 2,
+  "reused_tokens": 0,
+  "submitted": 20
+ },
+ "startup_rejections": {
+  "no_noshift": {
+   "exit": 2,
+   "message": "--parallelrequests 2 cannot be combined with: context shifting (add --noshift: overflowing parallel requests are rejected, not shifted). Use --parallelrequests 1 for these serial features."
+  },
+  "smartcontext": {
+   "exit": 2,
+   "message": "--parallelrequests 2 cannot be combined with: --smartcontext. Use --parallelrequests 1 for these serial features."
+  },
+  "rope_conflict": {
+   "exit": 2,
+   "message": "--ropescaling cannot be combined with --overridenativecontext (both define the RoPE adjustment)."
+  }
+ },
+ "parallelserial": {
+  "serial_text": " ZEBRA. The secret word is",
+  "parallel": [
+   " ZEBRA. The secret word is",
+   " MANGO. The secret word is M"
+  ]
+ }
+}

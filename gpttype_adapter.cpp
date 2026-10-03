@@ -6207,7 +6207,6 @@ std::string gpttype_runtime_status()
         par["pool_cells"] = batch_pool_cells();
         par["reserved_cells"] = batch_reserved_cells_locked();
         par["cached_cells"] = batch_cached_cells_locked();
-        par["serial_lane_cells"] = batch_seq_pos_count(llama_ctx_v4, 0);
         par["serial_lane_active"] = batch_legacy_active;
         par["serial_lane_waiting"] = batch_legacy_waiting;
         par["fastforward"] = batch_fastforward;
@@ -6245,9 +6244,9 @@ std::string gpttype_runtime_status()
             s["id"] = i;
             s["seq_id"] = slot.seq;
             s["n_ctx"] = llama_ctx_v4 ? (int) llama_n_ctx_seq(llama_ctx_v4) : 0;
-            s["kv_cells"] = batch_seq_pos_count(llama_ctx_v4, slot.seq);
-            s["cached_tokens"] = (int) slot.cache_tokens.size();
             BatchGenerateRequest * req = slot.request_id >= 0 ? batch_find_request_locked(slot.request_id) : nullptr;
+            s["cached_tokens"] = (int) slot.cache_tokens.size();
+            s["kv_cells"] = req ? req->n_past : (int) slot.cache_tokens.size(); //bookkeeping, not a live KV query
             s["is_processing"] = req != nullptr;
             s["id_task"] = req ? req->id : -1;
             if(req)
