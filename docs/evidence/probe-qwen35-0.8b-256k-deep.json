@@ -1,0 +1,55 @@
+{
+ "ctx": 262144,
+ "args": [
+  "--quantkv",
+  "q8_0",
+  "--noshift",
+  "--batchsize",
+  "2048"
+ ],
+ "probes": [
+  {
+   "target_tokens": 100000,
+   "prompt_tokens": 92340,
+   "seconds": 213.3,
+   "prefill_tok_s": 432.8,
+   "found": true,
+   "text": " 81300. Remember",
+   "status": 200
+  },
+  {
+   "target_tokens": 200000,
+   "prompt_tokens": 184644,
+   "seconds": 733.1,
+   "prefill_tok_s": 251.9,
+   "found": true,
+   "text": " 81600. Remember",
+   "status": 200
+  }
+ ],
+ "context": {
+  "allocated_cells": 262400,
+  "capacity_status": "allocated",
+  "flash_attn": true,
+  "kv_bytes_draft": 0,
+  "kv_bytes_target": 1733148672,
+  "kv_type_k": "q8_0",
+  "kv_type_v": "q8_0",
+  "n_ctx_seq": 262400,
+  "n_ctx_train": 262144,
+  "n_seq_max": 1,
+  "position_coverage": 262144,
+  "quality_status": "within trained context; long-context quality not verified by this runtime",
+  "quality_verified": false,
+  "requested_ctx": 262144,
+  "rope_freq_base": 10000000.0,
+  "rope_freq_base_train": 10000000.0,
+  "rope_freq_scale": 1.0,
+  "rope_scaling": "none",
+  "yarn_attn_factor": -1.0,
+  "yarn_beta_fast": -1.0,
+  "yarn_beta_slow": -1.0,
+  "yarn_ext_factor": -1.0,
+  "yarn_orig_ctx": 262144
+ }
+}
