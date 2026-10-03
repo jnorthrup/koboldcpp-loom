@@ -1,0 +1,89 @@
+{
+ "model": "unsloth/Qwen3.8-27B-GGUF@4ca72078 Qwen3.8-27B-UD-Q2_K_XL.gguf sha256 fd4730dd8aad070517978752b63d530aeb1740d2283cab9fa24f1e404032ddb0",
+ "mtp_head": "MTP/mtp-Qwen3.8-27B-Q4_0.gguf sha256 50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e (arch qwen35, nextn_predict_layers 1), loaded via --draftmodel",
+ "host": "Apple M3 Pro 36GiB, Metal",
+ "args": "--parallelrequests 2 --noshift --quantkv q8_0 --draftamount 2 --contextsize 8192",
+ "mtp_runtime": {
+  "active": true,
+  "checkpoint_rollback": false,
+  "n_draft_max": 2,
+  "n_rs_seq": 2,
+  "parallel_lane": true,
+  "requested": false,
+  "serial_lane": true,
+  "speculative_type": "draft-mtp",
+  "status": "active (serial and parallel lanes)"
+ },
+ "context": {
+  "allocated_cells": 8448,
+  "capacity_status": "allocated",
+  "flash_attn": true,
+  "kv_bytes_draft": 18382848,
+  "kv_bytes_target": 1706164224,
+  "kv_type_k": "q8_0",
+  "kv_type_v": "q8_0",
+  "n_ctx_seq": 8448,
+  "n_ctx_train": 262144,
+  "n_seq_max": 3,
+  "position_coverage": 262144,
+  "quality_status": "within trained context; long-context quality not verified by this runtime",
+  "quality_verified": false,
+  "requested_ctx": 8192,
+  "rope_freq_base": 10000000.0,
+  "rope_freq_base_train": 10000000.0,
+  "rope_freq_scale": 1.0,
+  "rope_scaling": "none",
+  "yarn_attn_factor": -1.0,
+  "yarn_beta_fast": -1.0,
+  "yarn_beta_slow": -1.0,
+  "yarn_ext_factor": -1.0,
+  "yarn_orig_ctx": 262144
+ },
+ "with_mtp": {
+  "gen1": {
+   "status": 200,
+   "seconds": 9.88,
+   "tok_s": 9.71,
+   "completion_tokens": 96,
+   "draft_tokens": 76,
+   "draft_accepted": 57,
+   "text": "\n\nThe sky is blue because of Rayleigh scattering, where shorter wavelengths of light (blue and violet) are scattered more by the molecules in the atmosphere than longer wavelengths (red and orange). This scattering makes the sky appear blue to our eyes.\n\nThe sky is blue because of Rayleigh scattering, where shorter wavelengths of light (blue and violet) are scattered more by the molecules in the atmosphere than longer wavelengths (red and orange). This scattering makes the sky appear blue to our"
+  },
+  "gen2_concurrent": {
+   "status": [
+    200,
+    200
+   ],
+   "wall_seconds": 17.99,
+   "aggregate_tok_s": 7.12,
+   "draft_tokens": 135,
+   "draft_accepted": 58,
+   "acceptance": 0.43
+  },
+  "admission": {
+   "input_tokens": 14,
+   "usage_prompt_tokens": 14,
+   "match": true
+  },
+  "totals": {
+   "aborted": 0,
+   "completed": 4,
+   "completion_tokens": 240,
+   "decode_calls": 81,
+   "draft_accepted": 125,
+   "draft_tokens": 221,
+   "failed": 0,
+   "peak_live": 2,
+   "prompt_tokens": 42,
+   "rejected_context": 0,
+   "rejected_unsupported": 0,
+   "reused_tokens": 0,
+   "submitted": 4
+  }
+ },
+ "without_mtp": {
+  "gen1_tok_s": 10.29,
+  "gen2_concurrent_aggregate_tok_s": 11.36
+ },
+ "note": "Split MTP head is active in both lanes (draft-mtp, rs rollback n_rs_seq=2). Single stream: 57/76 drafts accepted (0.75) but 9.71 tok/s vs 10.29 without MTP. Two concurrent: acceptance 0.43, 7.12 vs 11.36 tok/s aggregate. On this host MTP does not pay for itself at Q2_K_XL; memory-bandwidth bound target + Q4_0 head."
+}
