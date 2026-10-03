@@ -28,8 +28,13 @@ Persistent state: the continuum from "a user's KV cache" to "a GPU's token dump"
   1 recipe            loom script                    done (/v1/looms)
   2 run artifact      requests + responses           done (loom-run/1, replay)
   3 warm process      KV slots in RAM                done (--loomcache; lost on idle-out)
-  4 state file        NOT DOING (operator decision, 2026-09-27): a KV/state snapshot is
-  5 shared dump       gigabytes per loom (a 27B model at 16k context is GB-scale), so
-                      looms persist as text only. After a cold start, a --prewarm run
-                      (max_tokens=1 per leaf) rebuilds the RAM cache from the recipe.
+  4 state file        IN PROGRESS (operator reversal, 2026-10-03): portable LOOMKV01 envelope,
+  5 shared dump       loomstate.py. One committed sequence (main KV, draft KV, logits, tokens) with a
+                      canonical-CBOR descriptor (byte-identical to confix-rs) and sha256 section
+                      digests. Import refuses unless model hash, KV types, n_ctx, engine pin, backend
+                      and arch all match; on refusal the caller replays the recipe with --prewarm.
+                      Size is not GB-scale on hybrid models (Qwen3.8-27B: ~290 MiB per 4K-token q8_0
+                      branch; only 16 of 64 layers keep KV) - dense models are ~4x larger.
+                      Done: envelope + refuse-on-mismatch (tests/test_loomstate.py).
+                      Not done: engine export/import endpoints, signing (mesh side), GCS placement.
   Hosting/billing proposal: runpod experiments/loom/docs/looms-hosting-proposal.md.
