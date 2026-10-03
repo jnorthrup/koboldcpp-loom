@@ -52,3 +52,9 @@ private:
         int img_ny
     );
 };
+
+struct common_batch;
+// convert a legacy llama_batch (as built by kcpp_embd_batch) into a common_batch with identical
+// entries: seq 0 and positions continuing from memory when absent, last token is output by default.
+// Kept on the kobold side because upstream llama.cpp removed it after the llama_batch_ext migration.
+common_batch kcpp_common_batch_from_llama_batch(struct llama_context * ctx, const llama_batch & batch);

@@ -1132,7 +1132,7 @@ static int32_t kcpp_decode_main_and_spec(llama_context * main_ctx, llama_batch b
         {
             llama_memory_seq_rm(llama_get_memory(draft_ctx), batch.seq_id[0][0], batch.pos[0], -1);
         }
-        if(!common_speculative_process(draft_spec, batch))
+        if(!common_speculative_process(draft_spec, kcpp_common_batch_from_llama_batch(main_ctx, batch)))
         {
             kcpp_flush_log_output();
             printf("\nERROR: Speculative state update failed!\n");
@@ -5406,22 +5406,21 @@ static bool batch_claim_waiting_locked()
 }
 
 //target decode followed by the speculative state update (llama.cpp v0.5.0 server order)
-static int32_t batch_decode(llama_batch & batch)
+static int32_t batch_decode(common_batch & batch)
 {
     if(batch_spec_enabled && draft_ctx && batch_spec_dft_rollback)
     {
         int last_seq = -1;
-        for(int i = 0; i < batch.n_tokens; ++i)
+        for(const auto & t : batch.tokens)
         {
-            const int s = batch.seq_id[i][0];
-            if(s != last_seq)
+            if(t.seq_id != last_seq)
             {
-                llama_memory_seq_rm(llama_get_memory(draft_ctx), s, batch.pos[i], -1);
-                last_seq = s;
+                llama_memory_seq_rm(llama_get_memory(draft_ctx), t.seq_id, t.pos[0], -1);
+                last_seq = t.seq_id;
             }
         }
     }
-    const int32_t status = llama_decode(llama_ctx_v4, batch);
+    const int32_t status = llama_process(llama_ctx_v4, LLAMA_PROCESS_TYPE_DECODE, batch.get());
     batch_totals.decode_calls++;
     if(status == 0 && batch_spec_enabled && draft_spec)
     {
@@ -5450,7 +5449,7 @@ struct BatchStepOutcome
 static void batch_worker_loop()
 {
     const int batch_cap = std::max(1, kcpp_data ? kcpp_data->n_batch : 512);
-    llama_batch batch = llama_batch_init(batch_cap, 0, 1);
+    common_batch batch(llama_ctx_v4);
     std::vector<BatchGenerateRequest *> live;
     std::vector<BatchStepOutcome> outcomes;
     while(true)
@@ -5544,7 +5543,7 @@ static void batch_worker_loop()
         }
 
         //build the batch: generation (pending + draft) first, then prompt chunks
-        common_batch_clear(batch);
+        batch.clear();
         for(auto * req : live)
         {
             req->rows.clear();
@@ -5557,21 +5556,19 @@ static void batch_worker_loop()
                 continue;
             }
             const int seq = batch_slots[req->slot].seq;
-            if(batch.n_tokens + 1 + (int) req->draft.size() > batch_cap)
+            if(batch.size() + 1 + (int) req->draft.size() > batch_cap)
             {
                 req->draft.clear();
             }
-            if(batch.n_tokens + 1 > batch_cap)
+            if(batch.size() + 1 > batch_cap)
             {
                 continue;
             }
             req->in_batch = true;
-            req->rows.push_back(batch.n_tokens);
-            common_batch_add(batch, req->pending_token, req->n_past, { seq }, true);
+            req->rows.push_back(batch.add(req->pending_token, req->n_past, seq, true));
             for(size_t k = 0; k < req->draft.size(); ++k)
             {
-                req->rows.push_back(batch.n_tokens);
-                common_batch_add(batch, req->draft[k], req->n_past + 1 + (int) k, { seq }, true);
+                req->rows.push_back(batch.add(req->draft[k], req->n_past + 1 + (int) k, seq, true));
             }
         }
         for(auto * req : live)
@@ -5581,22 +5578,22 @@ static void batch_worker_loop()
                 continue;
             }
             const int seq = batch_slots[req->slot].seq;
-            while(req->prompt_pos < req->n_prompt && batch.n_tokens < batch_cap)
+            while(req->prompt_pos < req->n_prompt && batch.size() < batch_cap)
             {
                 req->in_batch = true;
                 const bool is_last = (req->prompt_pos == req->n_prompt - 1);
+                //only the last prompt token needs logits; MTP catch-up uses the unmasked NextN rows of every token
+                const int32_t idx = batch.add(req->prompt_tokens[req->prompt_pos], req->n_past, seq, is_last);
                 if(is_last)
                 {
-                    req->rows.push_back(batch.n_tokens);
+                    req->rows.push_back(idx);
                 }
-                //only the last prompt token needs logits; MTP catch-up uses the unmasked NextN rows of every token
-                common_batch_add(batch, req->prompt_tokens[req->prompt_pos], req->n_past, { seq }, is_last);
                 req->kv_tokens.push_back(req->prompt_tokens[req->prompt_pos]);
                 req->prompt_pos++;
                 req->n_past++;
             }
         }
-        if(batch.n_tokens == 0)
+        if(batch.size() == 0)
         {
             continue;
         }
@@ -5795,7 +5792,6 @@ static void batch_worker_loop()
             }
         }
     }
-    llama_batch_free(batch);
 }
 
 static void batch_start_worker_locked()
