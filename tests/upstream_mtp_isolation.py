@@ -49,7 +49,13 @@ def run(name, extra):
         proc.terminate(); proc.wait(timeout=60); log.close()
 
 
+EXTRA = os.environ.get("UPSTREAM_EXTRA", "").split()  # e.g. "-kvu" to force a unified KV cache
+ONLY = os.environ.get("UPSTREAM_ONLY", "")  # "mtp" or "nomtp"
 os.makedirs(OUT, exist_ok=True)
-out = {"mtp": run("mtp", ["-md", HEAD, "--spec-type", "draft-mtp", "--spec-draft-n-max", "2"]), "nomtp": run("nomtp", [])}
+out = {"extra": EXTRA}
+if ONLY in ("", "mtp"):
+    out["mtp"] = run("mtp" + "".join(EXTRA), ["-md", HEAD, "--spec-type", "draft-mtp", "--spec-draft-n-max", "2"] + EXTRA)
+if ONLY in ("", "nomtp"):
+    out["nomtp"] = run("nomtp" + "".join(EXTRA), EXTRA)
 print(json.dumps(out))
-json.dump(out, open(os.path.join(OUT, "upstream-mtp-isolation.json"), "w"), indent=1)
+json.dump(out, open(os.path.join(OUT, "upstream-mtp-isolation%s.json" % "".join(EXTRA)), "w"), indent=1)

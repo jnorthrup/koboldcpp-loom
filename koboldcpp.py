@@ -371,7 +371,9 @@ class load_model_inputs(ctypes.Structure):
                 ("yarn_ext_factor", ctypes.c_float),
                 ("yarn_attn_factor", ctypes.c_float),
                 ("yarn_beta_fast", ctypes.c_float),
-                ("yarn_beta_slow", ctypes.c_float)]
+                ("yarn_beta_slow", ctypes.c_float),
+                ("draft_mode", ctypes.c_int),
+                ("draft_cost", ctypes.c_float)]
 
 class generation_inputs(ctypes.Structure):
     _fields_ = [("seed", ctypes.c_int),
@@ -2231,6 +2233,8 @@ def load_model(model_filename):
     inputs.yarn_attn_factor = float(getattr(args, "yarnattnfactor", -1.0))
     inputs.yarn_beta_fast = float(getattr(args, "yarnbetafast", -1.0))
     inputs.yarn_beta_slow = float(getattr(args, "yarnbetaslow", -1.0))
+    inputs.draft_mode = 1 if str(getattr(args, "draftmode", "fixed") or "fixed").lower() == "adaptive" else 0
+    inputs.draft_cost = float(getattr(args, "draftcost", 0.18) or 0.18)
     if inputs.rope_scaling_type >= 0 and args.overridenativecontext and args.overridenativecontext > 0:
         exit_with_error(2, "--ropescaling cannot be combined with --overridenativecontext (both define the RoPE adjustment).")
 
@@ -13896,6 +13900,8 @@ if __name__ == '__main__':
     advparser.add_argument("--yarnbetafast", help="YaRN low correction dimension (negative = model default).", type=float, default=-1.0)
     advparser.add_argument("--yarnbetaslow", help="YaRN high correction dimension (negative = model default).", type=float, default=-1.0)
     advparser.add_argument("--parallelserial", help="With --parallelrequests, route requests that need serial-only features (image/audio input, CFG, retained grammar, phrase bans) to the serial lane instead of rejecting them. The serial lane waits for running parallel requests to finish.", action='store_true')
+    advparser.add_argument("--draftmode", help="MTP draft length policy for the parallel lane. 'fixed' always drafts --draftamount tokens. 'adaptive' picks 0-8 drafts per request per round from per-position acceptance estimates and the target's confidence, extending only while the expected accepted tokens beat --draftcost (cost model from the yukon.org MLX.fast Qwen3.8 MTP challenge).", type=str.lower, choices=['fixed','adaptive'], default="fixed")
+    advparser.add_argument("--draftcost", help="Adaptive draft mode: cost of one extra draft token relative to one verify forward (default 0.18; calibrate per backend/model).", type=float, default=0.18)
     advparser.add_argument("--savedatafile", metavar=('[savefile]'), help="If enabled, creates or opens a persistent database file on the server, that allows users to save and load their data remotely. A new file is created if it does not exist.", default="")
     advparser.add_argument("--singleinstance", help="Allows this KoboldCpp instance to be shut down by any new instance requesting the same port, preventing duplicate servers from clashing on a port.", action='store_true')
     advparser.add_argument("--smartcache", help="Enables intelligent context switching by saving KV cache snapshots to RAM. Requires fast forwarding.", metavar=('limit'), nargs='?', const=1, type=int, default=0)

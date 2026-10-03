@@ -94,6 +94,16 @@ static int continuous_batching_slots = 0;
 static bool batch_fastforward = false; //parallel slots reuse cached prompt prefixes (target memory supports partial seq_rm)
 static bool batch_spec_enabled = false; //MTP drafting also runs in the parallel lane, one speculative state per sequence
 static bool batch_spec_dft_rollback = false; //draft context owns KV that is trimmed before each target decode
+//adaptive MTP draft depth (ported from the yukon.org MLX.fast Qwen3.8-27B MTP challenge record schedule,
+//Layr-Labs/qwen-3.8-mtp-challenge Qwen36MTPBlockSession.costModelDepth): per request, per round, extend the
+//draft while the estimated probability that the whole prefix is accepted beats the marginal verify cost.
+//  T(d) = 1 + d*h (verify width d+1, h = one extra draft row's cost relative to the verify forward)
+//  E(d) = 1 + sum_{k<=d} prod_{i<k} p_i (p_i = per-position acceptance EMA given the prefix was accepted)
+//  extend to k+1 while prod_{i<=k} p_i > h * (1 + S_k) / (1 + k*h)
+//The target's top-2 logit margin caps p_0 and p_1. 0 drafts is a legal round (costs a serial step).
+static int spec_draft_mode = 0; //0 = fixed (always --draftamount), 1 = adaptive cost model
+static float spec_draft_cost = 0.18f; //h; the challenge's measured optimum for an MLX stack with near-free prefix rejects
+static const int spec_adaptive_max_depth = 8;
 static common_context_seq_rm_type batch_tgt_seq_rm = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 static bool mtp_requested = false;
 static std::string mtp_status_reason = "not requested";
@@ -927,7 +937,7 @@ static bool speculative_state_setup(llama_context * main_ctx, const llama_contex
     spec_params.types = { type };
     spec_params.draft.ctx_tgt = main_ctx;
     spec_params.draft.ctx_dft = draft_ctx;
-    spec_params.draft.n_max = speculative_chunk_amt;
+    spec_params.draft.n_max = (spec_draft_mode == 1) ? std::max(speculative_chunk_amt, spec_adaptive_max_depth) : speculative_chunk_amt;
     spec_params.draft.n_min = 0;
     spec_params.draft.p_min = 0.0f;
     spec_params.draft.backend_sampling = true;
@@ -1047,7 +1057,7 @@ static void speculative_decoding_setup(std::string spec_model_filename, llama_co
         printf("Detected MTP draft head, using llama.cpp MTP speculative decoding.\n");
         draft_ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         draft_ctx_params.ctx_other = main_ctx;
-        draft_ctx_params.n_rs_seq = speculative_chunk_amt;
+        draft_ctx_params.n_rs_seq = (spec_draft_mode == 1) ? std::max(speculative_chunk_amt, spec_adaptive_max_depth) : speculative_chunk_amt;
         draft_ctx_params.n_outputs_max = base_ctx_params.n_seq_max; //draft-mtp generates tokens autoregressively (1 output per sequence per decode, looped up to n_max); cap outputs at n_seq instead of letting it default to n_batch, which sized the draft sampling buffer at n_batch*n_vocab (~2GB on large-vocab models like Gemma)
     }
     else if(draft_spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
@@ -3433,7 +3443,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         if((inputs.use_mtp || draftmodel_filename != "") && inputs.draft_amount > 0)
         {
             // Match llama-server's target rollback slots for speculative verification.
-            llama_ctx_params.n_rs_seq = inputs.draft_amount;
+            llama_ctx_params.n_rs_seq = (inputs.draft_mode == 1) ? std::max(inputs.draft_amount, spec_adaptive_max_depth) : inputs.draft_amount;
         }
         if(inputs.use_direct_io)
         {
@@ -3947,6 +3957,8 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             }
 
             speculative_chunk_amt = inputs.draft_amount;
+            spec_draft_mode = inputs.draft_mode;
+            spec_draft_cost = inputs.draft_cost > 0.0f ? inputs.draft_cost : 0.18f;
             if(draftmodel_filename != "")
             {
                 if(inputs.use_mtp)
@@ -4648,6 +4660,9 @@ struct BatchGenerateRequest
     llama_token pending_token = 0;
     std::vector<llama_token> kv_tokens; //tokens committed to this request's KV sequence, in order
     std::vector<llama_token> draft;
+    std::vector<double> accept_ema; //adaptive depth: P(draft position i accepted | prefix accepted)
+    float last_top2_margin = -1.0f; //target logit margin (top1 - top2) of the pending token, -1 = unknown
+    int draft_rounds_skipped = 0; //rounds where the adaptive policy chose 0 drafts
     std::vector<int> rows;
     bool in_batch = false;
 
@@ -5058,6 +5073,76 @@ struct BatchSamplerStateSwap
 };
 
 //per-request equivalent of SampleLogits (kobold sampler semantics) using request-local state
+//top-2 logit margin of a target row; the challenge caps p_0/p_1 with sigmoid(margin/2), sigmoid(margin/3)
+static float batch_top2_margin(const float * logits)
+{
+    float a = -INFINITY, b = -INFINITY;
+    for(int i = 0; i < n_vocab; ++i)
+    {
+        const float v = logits[i];
+        if(v > a) { b = a; a = v; }
+        else if(v > b) { b = v; }
+    }
+    return std::isfinite(b) ? (a - b) : -1.0f;
+}
+
+static int batch_adaptive_depth(BatchGenerateRequest & req, int cap)
+{
+    if(req.accept_ema.empty())
+    {
+        //optimistic, gently decaying prior; the EMA converges to the prompt within ~10 rounds
+        for(int i = 0; i < spec_adaptive_max_depth; ++i)
+        {
+            req.accept_ema.push_back(0.85 * std::pow(0.98, (double) i));
+        }
+    }
+    cap = std::min(cap, (int) req.accept_ema.size());
+    const double h = spec_draft_cost;
+    double reach = 1.0;
+    double expected = 0.0;
+    int depth = 0;
+    while(depth < cap)
+    {
+        double p = req.accept_ema[depth];
+        if(req.last_top2_margin >= 0.0f && depth <= 1)
+        {
+            const double conf = 1.0 / (1.0 + std::exp(-req.last_top2_margin / (depth == 0 ? 2.0 : 3.0)));
+            p = std::min(p, conf);
+        }
+        reach *= p;
+        const double threshold = h * (1.0 + expected) / (1.0 + depth * h);
+        if(!(reach > threshold))
+        {
+            break;
+        }
+        expected += reach;
+        ++depth;
+    }
+    return depth;
+}
+
+static void batch_record_accept(BatchGenerateRequest & req, int accepted, int drafted, bool stopped_early)
+{
+    if(req.accept_ema.empty())
+    {
+        return;
+    }
+    const double alpha = 0.15;
+    for(int i = 0; i < accepted && i < (int) req.accept_ema.size(); ++i)
+    {
+        req.accept_ema[i] += alpha * (1.0 - req.accept_ema[i]);
+    }
+    if(accepted < drafted && !stopped_early && accepted < (int) req.accept_ema.size())
+    {
+        req.accept_ema[accepted] += alpha * (0.0 - req.accept_ema[accepted]);
+    }
+    else if(accepted == drafted && drafted > 0 && accepted < (int) req.accept_ema.size() && req.accept_ema[accepted] < 0.95)
+    {
+        //a fully accepted round is evidence about the next position too (capped optimism)
+        req.accept_ema[accepted] += alpha * (0.95 - req.accept_ema[accepted]);
+    }
+}
+
 static llama_token batch_sample_token(BatchGenerateRequest & req, const float * logits)
 {
     static thread_local std::vector<llama_token_data> candidates;
@@ -5517,7 +5602,15 @@ static void batch_worker_loop()
                     continue;
                 }
                 const int remaining = req->max_length - req->n_generated;
-                int n_max = std::min(speculative_chunk_amt, remaining - 1);
+                int n_max = std::min(spec_draft_mode == 1 ? std::max(speculative_chunk_amt, spec_adaptive_max_depth) : speculative_chunk_amt, remaining - 1);
+                if(spec_draft_mode == 1)
+                {
+                    n_max = std::min(n_max, batch_adaptive_depth(*req, n_max));
+                    if(n_max <= 0)
+                    {
+                        req->draft_rounds_skipped++;
+                    }
+                }
                 n_max = std::min(n_max, req->n_ctx_cap - req->n_past - 1);
                 n_max = std::min(n_max, verify_budget);
                 n_max = std::min(n_max, draft_rows_budget - 1);
@@ -5642,14 +5735,26 @@ static void batch_worker_loop()
                     {
                         common_speculative_begin(draft_spec, seq, req->kv_tokens);
                     }
-                    sampled.push_back(batch_sample_token(*req, llama_get_logits_ith(llama_ctx_v4, req->rows[0])));
+                    {
+                        const float * lg = llama_get_logits_ith(llama_ctx_v4, req->rows[0]);
+                        if(spec_draft_mode == 1)
+                        {
+                            req->last_top2_margin = batch_top2_margin(lg); //raw logits, before sampling mutates candidates
+                        }
+                        sampled.push_back(batch_sample_token(*req, lg));
+                    }
                 }
                 else
                 {
                     oc.n_draft = (int) req->draft.size();
                     for(int k = 0; k <= oc.n_draft; ++k)
                     {
-                        const llama_token t = batch_sample_token(*req, llama_get_logits_ith(llama_ctx_v4, req->rows[k]));
+                        const float * lg = llama_get_logits_ith(llama_ctx_v4, req->rows[k]);
+                        if(spec_draft_mode == 1)
+                        {
+                            req->last_top2_margin = batch_top2_margin(lg); //margin of the row that becomes the next pending token
+                        }
+                        const llama_token t = batch_sample_token(*req, lg);
                         sampled.push_back(t);
                         if(is_stop_token(t))
                         {
@@ -5678,6 +5783,11 @@ static void batch_worker_loop()
                     if(oc.n_draft > 0)
                     {
                         common_speculative_accept(draft_spec, seq, (uint16_t) oc.n_accepted);
+                        if(spec_draft_mode == 1)
+                        {
+                            const bool stopped = oc.n_accepted > 0 && is_stop_token(req->draft[oc.n_accepted - 1]);
+                            batch_record_accept(*req, oc.n_accepted, oc.n_draft, stopped);
+                        }
                     }
                 }
             }
@@ -6291,6 +6401,7 @@ std::string gpttype_runtime_status()
                 s["reserve"] = req->reserve;
                 s["draft_n"] = req->draft_n;
                 s["draft_n_accepted"] = req->draft_accepted;
+                s["draft_rounds_skipped"] = req->draft_rounds_skipped;
             }
             else
             {
@@ -6305,7 +6416,9 @@ std::string gpttype_runtime_status()
     mtp["requested"] = mtp_requested;
     mtp["active"] = (draft_spec != nullptr && draft_is_mtp && draft_spec_type_active == COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
     mtp["speculative_type"] = draft_spec ? common_speculative_type_to_str(draft_spec_type_active) : "none";
-    mtp["n_draft_max"] = draft_spec ? speculative_chunk_amt : 0;
+    mtp["n_draft_max"] = draft_spec ? (spec_draft_mode == 1 ? std::max(speculative_chunk_amt, spec_adaptive_max_depth) : speculative_chunk_amt) : 0;
+    mtp["draft_mode"] = spec_draft_mode == 1 ? "adaptive" : "fixed";
+    mtp["draft_cost"] = spec_draft_cost;
     mtp["serial_lane"] = draft_spec != nullptr;
     mtp["parallel_lane"] = batch_spec_enabled;
     mtp["checkpoint_rollback"] = mtp_uses_spec_checkpoint;

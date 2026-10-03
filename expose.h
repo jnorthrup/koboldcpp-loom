@@ -99,6 +99,8 @@ struct load_model_inputs
     const float yarn_attn_factor = -1.0f;
     const float yarn_beta_fast = -1.0f;
     const float yarn_beta_slow = -1.0f;
+    const int draft_mode = 0; //0 = fixed draft length (--draftamount), 1 = adaptive cost-model depth (parallel lane)
+    const float draft_cost = 0.18f; //adaptive depth: cost of one extra draft row relative to the verify forward
 };
 struct generation_inputs
 {

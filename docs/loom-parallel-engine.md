@@ -114,6 +114,26 @@ Interrogate (`/sdapi/v1/interrogate`) always uses the serial lane. Image generat
 - Hybrid models use recurrent rollback snapshots (`n_rs_seq = draft`).
 - Prompt positions request outputs so the MTP head sees hidden states for the whole prompt.
 - Active state is reported at load time and in `GET /api/extra/runtime` under `mtp`: requested, active, speculative type, draft max, lane coverage, checkpoint vs RS rollback, and the reason when inactive.
+- A split MTP head (for example unsloth `MTP/mtp-Qwen3.8-27B-Q4_0.gguf`) loads through `--draftmodel` and is detected as `draft-mtp`.
+
+#### Draft-length policy (`--draftmode fixed|adaptive`)
+
+- `fixed` (default) drafts `--draftamount` tokens every round.
+- `adaptive` is ported from the record schedule of the yukon.org MLX.fast Qwen 3.8 27B MTP challenge (`Layr-Labs/qwen-3.8-mtp-challenge`, `Qwen36MTPBlockSession.costModelDepth`). It runs in the parallel lane only; the serial lane keeps a fixed draft length.
+  - Each request keeps a per-position acceptance estimate: an EMA with α 0.15, seeded optimistic at `0.85·0.98^i`. Optimism after a fully accepted round is capped at 0.95.
+  - Each round extends the draft while `∏ p_i > h·(1+S_k)/(1+k·h)`. Here `h = --draftcost` is the cost of one extra draft row relative to a verify forward. It defaults to 0.18, the challenge's measured optimum, and should be refitted per backend with `tests/bench_mtp_depth.py`.
+  - The target's top-2 logit margin caps `p_0` and `p_1`. A round may draft 0 tokens, which costs one serial step.
+  - The upper bound is 8. Recurrent rollback snapshots (`n_rs_seq`) are sized for 8 in this mode.
+
+#### Determinism limits (measured)
+
+- The parallel lane reproduces the serial lane byte-for-byte under MTP. Same draft counts, same text (`test_mtp_parity`).
+- MTP-on vs MTP-off and solo vs concurrent are not guaranteed identical. llama.cpp kernels are not batch-invariant: a different verify width or batch composition can flip a greedy near-tie.
+  - On Qwen3.8-27B UD-Q2_K_XL at 64 tokens, depth 2 matched no-MTP and depth 3 diverged at character 185.
+  - Kobold's serial lane diverges at the same point, so this is not a parallel-lane bug.
+  - A per-slot KV layout was tried. It made one run match but did not remove the class of flips, so it was not kept.
+  - Upstream llama-server v0.5.0 matched at depths 2–4 for this prompt. That is one prompt, not a guarantee.
+- The yukon challenge reaches exact parity only through bit-exact kernels; that is out of scope here.
 
 ### Counters
 

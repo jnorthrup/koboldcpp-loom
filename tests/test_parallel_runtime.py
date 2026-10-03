@@ -446,6 +446,61 @@ def test_mtp_row_budget():
         EVIDENCE["mtp_row_budget"] = ev
 
 
+def test_mtp_parity():
+    """Lane equivalence under MTP, plus measured parity facts.
+
+    Asserted: the parallel lane reproduces the serial (legacy) lane byte-for-byte with the same MTP
+    config, i.e. the scheduler/verify/rollback adds no divergence of its own.
+    Reported, not asserted: MTP-on vs MTP-off and solo vs concurrent. llama.cpp kernels are not
+    batch-invariant: a different verify width or batch composition can flip a greedy near-tie.
+    Kobold's serial MTP path shows the same flips (Qwen3.8-27B: depth 3 diverges at char 185 in both
+    lanes with identical draft counts), so these are not lane bugs. (The yukon MLX.fast challenge
+    reaches exact parity only through bit-exact kernels.)
+    KCPP_TEST_DRAFT=<mtp head gguf> uses a split head via --draftmodel instead of --usemtp."""
+    if not MODEL or not EXPECT_MTP:
+        return
+    draft = os.environ.get("KCPP_TEST_DRAFT", "")
+    mtp_args = (["--draftmodel", draft] if draft else ["--usemtp"]) + ["--draftamount", str(DRAFT)]
+    prompts = ["Write a short poem about mountains.", "Write a short poem about rivers."]
+    n = int(os.environ.get("KCPP_TEST_PARITY_N", "64"))
+
+    def first_diff(a, b):
+        return next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), None if len(a) == len(b) else min(len(a), len(b)))
+
+    ev = {"draft": DRAFT, "prompts": {}}
+    texts = {}
+    for name, extra in (("serial_off", ["--parallelrequests", "1"]), ("serial_mtp", ["--parallelrequests", "1"] + mtp_args),
+                        ("parallel_mtp", ["--parallelrequests", "2", "--multiuser", "8"] + mtp_args)):
+        srv = Server("parity_" + name, ["--noshift"] + extra).start(timeout=1800)
+        try:
+            if name != "serial_off":
+                rt = srv.runtime()
+                check("parity %s: mtp active" % name, rt["mtp"]["active"], rt["mtp"])
+            for p in prompts:
+                st, b = gen(srv, p, n, ban_eos_token=True)
+                check("parity %s ok" % name, st == 200, b)
+                texts[(name, p)] = b["results"][0]
+            if name == "parallel_mtp":
+                pair = [b["results"][0] for _, b in run_concurrently([lambda p=p: gen(srv, p, n, ban_eos_token=True) for p in prompts])]
+                for p, c in zip(prompts, pair):
+                    texts[("parallel_mtp_pair", p)] = c
+        finally:
+            srv.stop()
+    for p in prompts:
+        ser = texts[("serial_mtp", p)]
+        par = texts[("parallel_mtp", p)]
+        check("parallel lane == serial lane under MTP (%s)" % p[-12:], par["text"] == ser["text"] and par["draft_tokens"] == ser["draft_tokens"]
+              and par["draft_accepted"] == ser["draft_accepted"],
+              {"first_diff": first_diff(par["text"], ser["text"]), "parallel": [par["draft_accepted"], par["draft_tokens"]],
+               "serial": [ser["draft_accepted"], ser["draft_tokens"]]})
+        off = texts[("serial_off", p)]["text"]
+        pair = texts[("parallel_mtp_pair", p)]["text"]
+        ev["prompts"][p] = {"mtp_vs_off_same": ser["text"] == off, "mtp_vs_off_first_diff": first_diff(ser["text"], off),
+                            "solo_vs_concurrent_same": par["text"] == pair, "solo_vs_concurrent_first_diff": first_diff(par["text"], pair),
+                            "draft": [ser["draft_accepted"], ser["draft_tokens"]]}
+    EVIDENCE["mtp_parity"] = ev
+
+
 def test_prefix_reuse():
     """Attention-only models: a finished slot keeps its tokens and the next request reuses the shared prefix.
     Hybrid/recurrent models report fastforward=false and are skipped."""
@@ -535,7 +590,7 @@ def main():
         print("KCPP_TEST_MODEL is not set; nothing to run")
         return 0
     failures = []
-    for t in (test_startup_rejections, test_parallel_engine, test_parallelserial_routing, test_streaming, test_mtp_row_budget, test_prefix_reuse, test_context_profiles):
+    for t in (test_startup_rejections, test_parallel_engine, test_parallelserial_routing, test_streaming, test_mtp_row_budget, test_mtp_parity, test_prefix_reuse, test_context_profiles):
         try:
             t()
             print("PASS", t.__name__)
