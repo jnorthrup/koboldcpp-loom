@@ -770,7 +770,7 @@ static bool ggml_is_view_op(enum ggml_op op) {
 
 #ifndef GGML_SCHED_MAX_COPIES
 //kcpp can reduce this if you want to try make buffer sizes smaller on multigpu
-#define GGML_SCHED_MAX_COPIES 2
+#define GGML_SCHED_MAX_COPIES 4
 #endif
 
 struct ggml_backend_sched_split {
@@ -1637,7 +1637,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
+            return false;
+        }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;

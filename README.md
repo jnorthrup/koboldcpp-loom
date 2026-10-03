@@ -28,7 +28,7 @@ KoboldCpp is an easy-to-use AI text-generation software for GGML and GGUF models
 - Ready-to-use binaries for Windows, MacOS, Linux. Runs directly with Colab, Docker, also supports other platforms if self-compiled (like  Android (via Termux) and Raspberry PI).
 - [Need help finding a model? Read this!](https://github.com/LostRuins/koboldcpp/wiki#getting-an-ai-model-file)
 
-## Phishing Scam Alert
+## Phishing Scam Alert ⚠️
 - Phishing SCAM Warning: koboldcpp.com is NOT an official site, please help to report it to google for impersonation. You should **ONLY** trust official downloads from the release binaries on the official github at https://github.com/LostRuins/koboldcpp/releases/latest
 
 ## Windows Usage (Precompiled Binary, Recommended)
@@ -68,6 +68,9 @@ Finally, obtain and load a GGUF model. See [here](#Obtaining-a-GGUF-model)
 - The docker uses a x86-64 Ubuntu Linux based environment interally, and expects a Nvidia or AMD GPU. It may perform suboptimally on some Windows and MacOS devices, and may outright fail for ARM. It applies crude AVX/AVX2 feature detection which may not work correctly on all systems, resulting in the failsafe binaries being loaded (speed will become extremely slow).
 - If you still want to proceed, the official docker can be found at https://hub.docker.com/r/koboldai/koboldcpp
 
+## Running without a model (External Provider)
+- KoboldCpp allows you to run just the frontend without loading any model, and instead connect to a supported online AI provider. Currently, AI Horde, OpenAI Compatible, Anthropic, OpenRouter, Gemini, Grok, Mistral are among the supported services. To run without a model and connect to a third party endpoint, use the `--nomodel` flag or select "Allow Launch without Model" checkbox from the Files tab in the GUI launcher. Alternatively, you can also use the KoboldAI Lite WebUI to connect directly via https://lite.koboldai.net
+
 ## Obtaining a GGUF model
 - KoboldCpp uses GGUF models. They are not included with KoboldCpp, but you can download GGUF files from other places such as [Bartowski's Huggingface](https://huggingface.co/bartowski). Search for "GGUF" on huggingface.co for plenty of compatible models in the `.gguf` format.
 - For beginners, we recommend [Qwen3-VL-8B](https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3-VL-8B-Instruct-Q4_K_S.gguf) **(Most Recommended, best all rounder model)**
@@ -89,6 +92,7 @@ For more information, be sure to run the program with the `--help` flag, or **[c
 when you can't use the precompiled binary directly, we provide an automated build script which uses conda to obtain all dependencies, and generates (from source) a ready-to-use a pyinstaller binary for linux users.
 - Clone the repo with `git clone https://github.com/LostRuins/koboldcpp.git`
 - Simply execute the build script with `./koboldcpp.sh dist` and run the generated binary. (Not recommended for systems that already have an existing installation of conda. Dependencies: curl, bzip2)
+If you want to build a universal binary that works on other systems like the one we provide you must set the KCPP_PORTABLE=1 environment variable before compiling.
 ```
 ./koboldcpp.sh # This launches the GUI for easy configuration and launching (X11 required).
 ./koboldcpp.sh --help # List all available terminal commands for using Koboldcpp, you can use koboldcpp.sh the same way as our python script and binaries.
@@ -218,9 +222,14 @@ and it will install everything required. Alternatively, you can download the abo
 - Llama / Llama2 / Llama3 / Alpaca / GPT4All / Vicuna / Koala / Pygmalion / Metharme / WizardLM / Mistral / Mixtral / Miqu / Qwen / Qwen2 / Yi / Gemma / Gemma2 / GPT-2 / Cerebras / Phi-2 / Phi-3 / GPT-NeoX / Pythia / StableLM / Dolly / RedPajama / GPT-J / RWKV4 / MPT / Falcon / Starcoder / Deepseek and many, **many** more.
 
 # Where can I download AI model files?
-- The best place to get GGUF text models is huggingface. For image models, CivitAI has a good selection. Here are some to get started.
-  - Text Generation: [L3-8B-Stheno-v3.2](https://huggingface.co/bartowski/L3-8B-Stheno-v3.2-GGUF/resolve/main/L3-8B-Stheno-v3.2-Q4_K_S.gguf) (smaller and weaker) or [Tiefighter 13B](https://huggingface.co/KoboldAI/LLaMA2-13B-Tiefighter-GGUF/resolve/main/LLaMA2-13B-Tiefighter.Q4_K_S.gguf) (old but very versatile model) or [Gemma-3-27B Abliterated](https://huggingface.co/mlabonne/gemma-3-27b-it-abliterated-GGUF/resolve/main/gemma-3-27b-it-abliterated.q4_k_m.gguf) (largest and most powerful)
-  - Image Generation: [Anything v3](https://huggingface.co/admruul/anything-v3.0/resolve/main/Anything-V3.0-pruned-fp16.safetensors) or [Deliberate V2](https://huggingface.co/Yntec/Deliberate2/resolve/main/Deliberate_v2.safetensors) or [Dreamshaper SDXL](https://huggingface.co/Lykon/dreamshaper-xl-v2-turbo/resolve/main/DreamShaperXL_Turbo_v2_1.safetensors)
-  - Image Recognition MMproj: [Pick the correct one for your model architecture here](https://huggingface.co/koboldcpp/mmproj/tree/main)
+- The best place to get GGUF text models is huggingface. For image models, CivitAI has a good selection. Here are some basics to get started.
+  - General Text Generation: [Qwen3-VL-8B](https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3-VL-8B-Instruct-Q4_K_S.gguf)
+    - Optionally, add [this Image Recognition MMproj file](https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF/resolve/main/mmproj-BF16.gguf) if you also want vision capabilities.
+  - Creative Writing and Roleplay: [L3-8B-Stheno-v3.2](https://huggingface.co/bartowski/L3-8B-Stheno-v3.2-GGUF/resolve/main/L3-8B-Stheno-v3.2-Q4_K_S.gguf)
+  - If you just want a small and fast model to test (or for mobile users and old PCs), you can use [Gemma3-4B](https://huggingface.co/ggml-org/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q4_K_M.gguf)
+  - Image Generation: [PicX Real](https://huggingface.co/koboldcpp/imgmodel/resolve/main/picx_real_q5_1.gguf)
   - Speech Recognition: [Whisper models for Speech-To-Text](https://huggingface.co/koboldcpp/whisper/tree/main)
   - Text-To-Speech: [TTS models for Narration](https://huggingface.co/koboldcpp/tts/tree/main)
+  - [more newbie templates](https://huggingface.co/koboldcpp/newbie-templates) - Contains premade KoboldCpp quick launch templates curated for newbies.
+  - [more popular templates](https://huggingface.co/koboldcpp/popular-templates) - Contains premade KoboldCpp quick launch templates curated for popularity.
+  - [more templates](https://huggingface.co/koboldcpp/kcppt/tree/main)

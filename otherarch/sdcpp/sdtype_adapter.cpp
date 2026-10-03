@@ -38,6 +38,17 @@ using namespace kcpp_sd;
 
 #include "avi_writer.h"
 
+// early callback log initialization
+namespace {
+    const bool _ = [] {
+        // activate kcpp logging backend, and prevent sd.cpp setting ggml logging
+        // callback (will keep using the default)
+        // the debug flag will be reset on the first image generation call
+        set_sd_log_level(1);
+        return true;
+    }();
+}
+
 struct LoraMap {
     std::vector<std::pair<std::string, float>> items;
     std::unordered_map<std::string, std::size_t> index;
@@ -362,6 +373,9 @@ static bool is_video_model(kcpp_sd::model_info info)
 
 bool sdtype_load_model(const sd_load_model_inputs inputs) {
 
+    sddebugmode = inputs.debugmode;
+    set_sd_log_level(sddebugmode);
+
     sd_is_quiet = inputs.quiet;
     set_sd_quiet(sd_is_quiet);
     executable_path = sd_get_u8path(inputs.executable_path);
@@ -401,6 +415,8 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
         lora_dynamic = !!(inputs.lora_apply_mode & (1<<3));
         lora_cache   = lora_dynamic && !!(inputs.lora_apply_mode & (1<<4));
     }
+    // TODO: LoRA caching produces errors after a preloaded LoRA is later removed on a request
+    lora_cache = false;
 
     if(lora_map.items.size() > 0)
     {
@@ -532,10 +548,6 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
         }
     }
 
-    sddebugmode = inputs.debugmode;
-
-    set_sd_log_level(sddebugmode);
-
     sd_ctx_params_t params = {};
     sd_ctx_params_init(&params);
 
@@ -558,7 +570,7 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     params.vae_conv_direct = sd_params->vae_conv_direct;
     params.model_args = "chroma_use_dit_mask=true";
     params.max_vram = max_vram.c_str();
-    params.stream_layers = inputs.stream_layers;
+    //params.stream_layers = inputs.stream_layers; // removed in master-843
     params.eager_load = true; //kcpp should preload everything
     params.enable_mmap = inputs.use_mmap;
     params.backend = backend.c_str();
@@ -681,6 +693,14 @@ static inline int rounddown_to(int n, int fac) {
 
 static inline int roundup_to(int n, int fac) {
     return ((n + fac - 1) / fac) * fac;
+}
+
+// round a float/double avoiding too many decimal places
+// (like 6/10 -> 0.6000000238418579)
+static inline double round_for_info(double v) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.6f", v);
+    return strtod(buf, nullptr);
 }
 
 const int img_side_min = 64;
@@ -1612,14 +1632,19 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         fflush(stdout);
 
         results = nullptr;
-        if (!generate_video(sd_ctx, &vid_gen_params, &results, &generated_num_results, &generated_audio)) {
+        int output_fps = vid_fps;
+        if (!generate_video(sd_ctx, &vid_gen_params, &results, &generated_num_results, &generated_audio, &output_fps)) {
             results = nullptr;
             generated_audio = nullptr;
         }
         if(!sd_is_quiet && sddebugmode==1)
         {
             printf("\nRequested Vid Frames: %d, Generated Vid Frames: %d\n",vid_req_frames, generated_num_results);
+            if (output_fps != vid_fps) {
+                printf("\nRequested FPS: %d, Generated FPS: %d\n", vid_fps, output_fps);
+            }
         }
+        vid_fps = output_fps;
     }
     else if (!is_img2img)
     {
@@ -1727,7 +1752,7 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         if (*params.negative_prompt)
             jsoninfo["negative_prompt"] = params.negative_prompt;
         jsoninfo["seed"] = params.seed;
-        jsoninfo["cfg_scale"] = params.sample_params.guidance.txt_cfg;
+        jsoninfo["cfg_scale"] = round_for_info(params.sample_params.guidance.txt_cfg);
         jsoninfo["width"] = params.width;
         jsoninfo["height"] = params.height;
         jsoninfo["steps"] = params.sample_params.sample_steps;
@@ -1738,9 +1763,9 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         if (params.sample_params.scheduler != scheduler_t::SCHEDULER_COUNT)
             jsoninfo["extra_generation_params"]["Schedule type"] = get_scheduler_name(params.sample_params.scheduler);
         if (params.sample_params.eta >= 0 && params.sample_params.eta <= 1)
-            jsoninfo["eta"] = params.sample_params.eta;
+            jsoninfo["eta"] = round_for_info(params.sample_params.eta);
         if (is_img2img)
-            jsoninfo["denoising_strength"] = params.strength;
+            jsoninfo["denoising_strength"] = round_for_info(params.strength);
         if (sd_params->model_path.empty())
             jsoninfo["sd_model_name"] = friendly_model_name(sd_params->diffusion_model_path);
         else
@@ -1906,13 +1931,52 @@ static void step_callback(int step, int frame_count, sd_image_t* image, bool is_
     }
 
     std::string preview;
-    if (image != nullptr) {
+    if (image != nullptr && frame_count > 0) {
+        constexpr uint32_t preview_max_dimension = 128;
+        std::vector<sd_image_t> resized_images(image, image + frame_count);
+        std::vector<std::vector<uint8_t>> resized_image_data(static_cast<size_t>(frame_count));
+        bool resize_ok = true;
+
+        for (int i = 0; i < frame_count; ++i) {
+            const sd_image_t& source = image[i];
+            if (source.width <= preview_max_dimension && source.height <= preview_max_dimension) {
+                continue;
+            }
+
+            uint32_t resized_width;
+            uint32_t resized_height;
+            if (source.width >= source.height) {
+                resized_width = preview_max_dimension;
+                resized_height = std::max(1u, static_cast<uint32_t>(
+                    static_cast<uint64_t>(source.height) * preview_max_dimension / source.width));
+            } else {
+                resized_height = preview_max_dimension;
+                resized_width = std::max(1u, static_cast<uint32_t>(
+                    static_cast<uint64_t>(source.width) * preview_max_dimension / source.height));
+            }
+
+            auto& pixels = resized_image_data[static_cast<size_t>(i)];
+            pixels.resize(static_cast<size_t>(resized_width) * resized_height * source.channel);
+            if (source.data == nullptr || source.channel == 0 ||
+                !stbir_resize_uint8(source.data, source.width, source.height, 0,
+                                    pixels.data(), resized_width, resized_height, 0, source.channel)) {
+                resize_ok = false;
+                break;
+            }
+            resized_images[static_cast<size_t>(i)] = {
+                resized_width, resized_height, source.channel, pixels.data()
+            };
+        }
+
+        sd_image_t* preview_images = resize_ok ? resized_images.data() : nullptr;
         if (frame_count == 1) {
-            preview = raw_image_to_png_base64(*image);
-        } else {
+            if (preview_images != nullptr) {
+                preview = raw_image_to_png_base64(*preview_images);
+            }
+        } else if (preview_images != nullptr) {
             uint8_t * out_data = nullptr;
             size_t out_len = 0;
-            if (create_gif_buf_from_sd_images_msf(image, frame_count, 16, &out_data,&out_len) == 0 && out_data && out_len > 0) {
+            if (create_gif_buf_from_sd_images_msf(preview_images, frame_count, 16, &out_data,&out_len) == 0 && out_data && out_len > 0) {
                 preview = kcpp_base64_encode(out_data, out_len);
             }
             if (out_data) {
