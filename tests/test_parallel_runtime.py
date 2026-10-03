@@ -327,6 +327,84 @@ def test_parallelserial_routing():
         EVIDENCE["parallelserial"] = ev
 
 
+def stream_oai_chat(server, messages, max_tokens):
+    body = {"messages": messages, "max_tokens": max_tokens, "temperature": 0, "top_k": 1, "seed": 7, "stream": True,
+            "stream_options": {"include_usage": True}}
+    req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % server.port, data=json.dumps(body).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    text, reasoning, usage, done, finish = "", "", None, False, None
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        status = resp.status
+        for raw in resp:
+            line = raw.decode("utf-8", "ignore").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                done = True
+                break
+            obj = json.loads(data)
+            if obj.get("usage"):
+                usage = obj["usage"]
+            for ch in obj.get("choices", []):
+                delta = ch.get("delta", {}) or {}
+                text += delta.get("content") or ""
+                reasoning += delta.get("reasoning_content") or ""
+                finish = ch.get("finish_reason") or finish
+    return {"status": status, "text": text, "reasoning": reasoning, "usage": usage, "done": done, "finish": finish}
+
+
+def stream_kai(server, prompt, max_length):
+    body = {"prompt": prompt, "max_length": max_length, "temperature": 0, "top_k": 1, "rep_pen": 1.0, "sampler_seed": 7}
+    req = urllib.request.Request("http://127.0.0.1:%d/api/extra/generate/stream" % server.port, data=json.dumps(body).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    text, events = "", 0
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "ignore").strip()
+            if line.startswith("data:"):
+                obj = json.loads(line[5:].strip())
+                text += obj.get("token", "")
+                events += 1
+    return {"text": text, "events": events}
+
+
+def test_streaming():
+    """Streaming in the parallel lane: concurrent OAI chat + KAI SSE streams reassemble to the non-stream output."""
+    if not MODEL:
+        return
+    srv = Server("streaming", ["--parallelrequests", "3", "--noshift", "--multiuser", "8"]).start()
+    ev = {}
+    try:
+        msgs = [[{"role": "user", "content": "Say the word %s three times." % w}] for w in ("ZEBRA", "MANGO")]
+        ref = []
+        for m in msgs:
+            st, body = srv.post("/v1/chat/completions", {"messages": m, "max_tokens": 24, "temperature": 0, "top_k": 1, "seed": 7})
+            check("non-stream chat ok", st == 200, body)
+            ref.append(body)
+        st, kref = gen(srv, secret_prompt("VIOLET"), 16)
+        check("non-stream kai ok", st == 200, kref)
+        res = run_concurrently([lambda m=m: stream_oai_chat(srv, m, 24) for m in msgs] + [lambda: stream_kai(srv, secret_prompt("VIOLET"), 16)])
+        rt = srv.runtime()
+        streams = []
+        for r, b in zip(res[:2], ref):
+            msg = b["choices"][0]["message"]
+            want = (msg.get("reasoning_content") or "") + (msg.get("content") or "")
+            got = r["reasoning"] + r["text"]
+            streams.append({"stream_text": got, "nonstream_text": want, "usage": r["usage"], "nonstream_usage": b["usage"], "done": r["done"], "finish": r["finish"]})
+            # thinking models split output into reasoning_content/content; compare the stripped concatenation
+            norm = lambda s: s.replace("<think>", "").replace("</think>", "").strip()  # stream moves think tags into reasoning_content
+            check("oai stream reassembles to non-stream text", r["done"] and norm(got) == norm(want), streams[-1])
+            check("oai stream usage matches non-stream", r["usage"] and r["usage"]["prompt_tokens"] == b["usage"]["prompt_tokens"] and r["usage"]["completion_tokens"] == b["usage"]["completion_tokens"], streams[-1])
+        kai = res[2]
+        check("kai stream reassembles", kai["text"] == kref["results"][0]["text"] and kai["events"] > 0, {"stream": kai, "nonstream": kref["results"][0]["text"]})
+        check("streams ran in parallel slots", rt["parallel"]["totals"]["peak_live"] >= 2, rt["parallel"]["totals"])
+        ev = {"oai": streams, "kai": kai, "totals": rt["parallel"]["totals"]}
+    finally:
+        srv.stop()
+        EVIDENCE["streaming"] = ev
+
+
 def test_prefix_reuse():
     """Attention-only models: a finished slot keeps its tokens and the next request reuses the shared prefix.
     Hybrid/recurrent models report fastforward=false and are skipped."""
@@ -416,7 +494,7 @@ def main():
         print("KCPP_TEST_MODEL is not set; nothing to run")
         return 0
     failures = []
-    for t in (test_startup_rejections, test_parallel_engine, test_parallelserial_routing, test_prefix_reuse, test_context_profiles):
+    for t in (test_startup_rejections, test_parallel_engine, test_parallelserial_routing, test_streaming, test_prefix_reuse, test_context_profiles):
         try:
             t()
             print("PASS", t.__name__)
