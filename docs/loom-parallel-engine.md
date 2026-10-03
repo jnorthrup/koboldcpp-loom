@@ -220,7 +220,10 @@ All four allocate and generate with MTP active. The shallow passkey probes show 
 - MTP: pass `--usemtp --draftamount 2` explicitly; `deploy/inference-worker/gpu-fit.md` assumes 2 while Kobold defaults to 4.
   - Read `GET /api/extra/runtime` → `mtp.active` to prove MTP is on, rather than inferring it from flags.
 - Memory planning (`gpu_fit.py`, `GGUF-VRAM.md`):
-  - The parallel KV pool is `n_ctx = slots × per-request context` (unified, padded to 256 per sequence) plus 128 fragmentation cells.
+  - The parallel lane uses one unified KV pool of `--contextsize + 128` cells, padded to 256, shared by all slots. It is not one context per slot.
+    - Measured: `--contextsize 4096` with 4 slots gives `pool_cells = n_ctx_seq = 4352`.
+    - Any single request may use the whole context, but live reservations (`prompt + max_tokens`) must fit the pool together. Otherwise the request waits in FIFO order.
+    - To serve N concurrent requests of up to C tokens each, set `--contextsize ≈ N × C`.
   - Hybrid recurrent state scales with `n_seq_max = slots + 1` and `(1 + draft)` snapshots.
 - YaRN: the chart's statement that "`--ropeconfig` cannot select YaRN" is superseded by `--ropescaling yarn --yarnorigctx`.
   - The 1M context point is now accepted by the CLI.
