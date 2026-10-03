@@ -95,7 +95,9 @@ PARROT_LIBDIR = otherarch/parrot/target/release
 PARROT_LIB = $(PARROT_LIBDIR)/libkcpp_parrot.a
 CFLAGS += -DKCPP_PARROT
 CXXFLAGS += -DKCPP_PARROT
-LDFLAGS += $(PARROT_LIB)
+# The archive is linked via KOBOLDCPP_COMMON_OBJS (a real prerequisite), never via
+# LDFLAGS: helper tools (vulkan-shaders-gen, quantizers) link $(LDFLAGS) without
+# depending on it and raced the cargo build under -j.
 ifeq ($(UNAME_S),Darwin)
 LDFLAGS += -framework Foundation -framework CoreFoundation -framework Security -lc++
 else ifeq ($(OS),Windows_NT)
@@ -105,7 +107,7 @@ LDFLAGS += -lstdc++ -lpthread -ldl -lm -lrt
 endif
 TTS_PARROT_DEPS = $(PARROT_LIB)
 $(PARROT_LIB): otherarch/parrot/Cargo.toml otherarch/parrot/src/lib.rs
-	cd otherarch/parrot && cargo build --release
+	cd otherarch/parrot && env -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS -u MAKEFLAGS -u MFLAGS -u MAKELEVEL cargo build --release --locked
 endif
 
 FASTCFLAGS = $(subst -O3,-Ofast,$(CFLAGS))
@@ -248,6 +250,14 @@ CUBLASLD_FLAGS += -Lconda/envs/linux/lib -Lconda/envs/linux/lib/stubs
 endif
 
 
+# LOOM: native SASS for the GPU classes we rent, so cold start skips PTX JIT.
+# LOOM_SASS="86 120" -> -gencode arch=compute_86,code=sm_86 ... (CU13 builds only).
+LOOM_SASS_FLAGS = $(foreach a,$(LOOM_SASS),-gencode arch=compute_$(a),code=sm_$(a))
+# LOOM: nvcc compiles each file's gencode targets in parallel (0 = all cores).
+ifdef LOOM_NVCC_THREADS
+NVCCFLAGS += --threads $(LOOM_NVCC_THREADS)
+endif
+
 ifdef LLAMA_PORTABLE
 
 ifdef LLAMA_ARCHES_CU11
@@ -273,6 +283,7 @@ NVCCFLAGS += -Wno-deprecated-gpu-targets \
              -gencode arch=compute_86,code=compute_86 \
              -gencode arch=compute_89,code=compute_89 \
              -gencode arch=compute_120,code=compute_120 \
+			 $(LOOM_SASS_FLAGS) \
 			 -DKCPP_LIMIT_CUDA_MAX_ARCH=1200
 
 else
@@ -927,6 +938,9 @@ endif
 
 # common object files for all libraries
 KOBOLDCPP_COMMON_OBJS = gpttype_adapter_default.o whispercpp_default.o clip_default.o expose.o chat.o ggml-binops.o ggml-iqp.o ggml-unops.o ggml-backend.o ggml-backend-meta.o ggml-repack.o llama.o llama-model.o embeddings_default.o music_default.o tts_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o $(OBJS) $(OBJS_SDTYPE)
+ifdef KCPP_PARROT
+KOBOLDCPP_COMMON_OBJS += $(PARROT_LIB)
+endif
 
 #generated libraries
 koboldcpp_default: ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml_v3.o ggml_v2.o ggml_v1.o kcpp_backend_default.o ggml-backend-reg_default.o $(KOBOLDCPP_COMMON_OBJS) $(OBJS_FULL)
