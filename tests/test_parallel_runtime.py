@@ -318,7 +318,13 @@ def test_parallelserial_routing():
     try:
         st, body = gen(srv, "The secret word is ZEBRA. The secret word is", 8, banned_tokens=["ZEBRA. The"])
         check("phrase ban routed to serial lane", st == 200, body)
-        check("routing logged", "routed to the serial lane" in srv.log_text(), "log")
+        routed = False
+        for _ in range(20): # server stdout reaches the log asynchronously
+            if "routed to the serial lane" in srv.log_text():
+                routed = True
+                break
+            time.sleep(0.25)
+        check("routing logged", routed, "log")
         res = run_concurrently([lambda w=w: gen(srv, secret_prompt(w), 8) for w in WORDS[:2]])
         check("parallel lane still serves", all(s == 200 for s, _ in res), res)
         ev = {"serial_text": body["results"][0]["text"], "parallel": [b["results"][0]["text"] for _, b in res]}

@@ -2605,10 +2605,10 @@ def parallel_admit(genparams, stream_flag):
     if sub.error_code == BATCH_ERR_UNSUPPORTED and getattr(args, "parallelserial", False):
         reason = sub.message.decode("UTF-8","ignore") if sub.message else ""
         genparams['_serial_lane'] = reason
-        print(f"\n[Parallel] Request routed to the serial lane: {reason}")
+        print(f"\n[Parallel] Request routed to the serial lane: {reason}", flush=True)
         return None
     code, body = parallel_submit_error(sub)
-    print(f"\n[Parallel] Request rejected ({body['error']['type']}): {body['error']['message']}")
+    print(f"\n[Parallel] Request rejected ({body['error']['type']}): {body['error']['message']}", flush=True)
     return code, body
 
 def finish_parallel_request(genparams, batch_request_id, stream_flag, genkey):
