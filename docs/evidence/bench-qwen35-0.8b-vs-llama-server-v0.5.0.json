@@ -1,0 +1,207 @@
+{
+ "model": "Qwen_Qwen3.5-0.8B-Q4_K_M.gguf sha256 fb044e93939a70469c905781334f5de1e6c8b608ced6cbc8c9249bd4127d9526",
+ "host": "Apple M3 Pro 36GiB, Metal",
+ "gen_tokens": 128,
+ "prompts": "4 essay prompts, greedy, EOS banned",
+ "kobold_branch_before_backport": {
+  "serial": {
+   "prefill": {
+    "prompt_tokens": 2001,
+    "seconds": 0.697,
+    "tok_s": 2872.2
+   },
+   "gen1": {
+    "seconds": 1.058,
+    "tok_s": 121.0,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   },
+   "gen4": {
+    "wall_seconds": 4.074,
+    "aggregate_tok_s": 125.67,
+    "tokens": 512,
+    "draft_tokens": 0,
+    "draft_accepted": 0,
+    "acceptance": null,
+    "per_request_seconds": [
+     3.06,
+     2.04,
+     1.03,
+     4.07
+    ]
+   }
+  },
+  "serial_mtp": {
+   "prefill": {
+    "prompt_tokens": 2001,
+    "seconds": 1.047,
+    "tok_s": 1910.6
+   },
+   "gen1": {
+    "seconds": 1.643,
+    "tok_s": 77.89,
+    "draft_tokens": 177,
+    "draft_accepted": 66
+   },
+   "gen4": {
+    "wall_seconds": 6.571,
+    "aggregate_tok_s": 77.92,
+    "tokens": 512,
+    "draft_tokens": 726,
+    "draft_accepted": 262,
+    "acceptance": 0.361,
+    "per_request_seconds": [
+     4.8,
+     3.2,
+     1.64,
+     6.57
+    ]
+   }
+  },
+  "parallel4": {
+   "prefill": {
+    "prompt_tokens": 2001,
+    "seconds": 0.631,
+    "tok_s": 3170.9
+   },
+   "gen1": {
+    "seconds": 0.979,
+    "tok_s": 130.78,
+    "draft_tokens": 0,
+    "draft_accepted": 0
+   },
+   "gen4": {
+    "wall_seconds": 2.653,
+    "aggregate_tok_s": 192.98,
+    "tokens": 512,
+    "draft_tokens": 0,
+    "draft_accepted": 0,
+    "acceptance": null,
+    "per_request_seconds": [
+     2.62,
+     2.65,
+     2.65,
+     2.65
+    ]
+   }
+  },
+  "parallel4_mtp": {
+   "prefill": {
+    "prompt_tokens": 2001,
+    "seconds": 0.956,
+    "tok_s": 2093.9
+   },
+   "gen1": {
+    "seconds": 1.431,
+    "tok_s": 89.46,
+    "draft_tokens": 177,
+    "draft_accepted": 66
+   },
+   "gen4": {
+    "wall_seconds": 3.238,
+    "aggregate_tok_s": 158.12,
+    "tokens": 512,
+    "draft_tokens": 726,
+    "draft_accepted": 262,
+    "acceptance": 0.361,
+    "per_request_seconds": [
+     3.13,
+     2.93,
+     3.13,
+     3.24
+    ]
+   }
+  }
+ },
+ "kobold_branch_after_4453b535f": {
+  "serial_mtp": {
+   "prefill": {
+    "prompt_tokens": 2001,
+    "seconds": 1.031,
+    "tok_s": 1941.3
+   },
+   "gen1": {
+    "seconds": 1.659,
+    "tok_s": 77.17,
+    "draft_tokens": 177,
+    "draft_accepted": 66
+   },
+   "gen4": {
+    "wall_seconds": 6.897,
+    "aggregate_tok_s": 74.24,
+    "tokens": 512,
+    "draft_tokens": 726,
+    "draft_accepted": 262,
+    "acceptance": 0.361,
+    "per_request_seconds": [
+     1.73,
+     3.35,
+     6.9,
+     5.1
+    ]
+   }
+  },
+  "parallel4_mtp": {
+   "prefill": {
+    "prompt_tokens": 2001,
+    "seconds": 0.942,
+    "tok_s": 2123.2
+   },
+   "gen1": {
+    "seconds": 1.463,
+    "tok_s": 87.5,
+    "draft_tokens": 177,
+    "draft_accepted": 66
+   },
+   "gen4": {
+    "wall_seconds": 3.272,
+    "aggregate_tok_s": 156.5,
+    "tokens": 512,
+    "draft_tokens": 726,
+    "draft_accepted": 262,
+    "acceptance": 0.361,
+    "per_request_seconds": [
+     3.12,
+     3.02,
+     3.16,
+     3.27
+    ]
+   }
+  }
+ },
+ "upstream_llama_server_v0.5.0_7fe450e": {
+  "nomtp": {
+   "gen1": {
+    "seconds": 0.922,
+    "tok_s": 138.87,
+    "predicted_per_second": 141.36572649182582,
+    "draft_n": null,
+    "draft_n_accepted": null
+   },
+   "gen4": {
+    "wall_seconds": 2.535,
+    "aggregate_tok_s": 201.99,
+    "draft_n": 0,
+    "draft_n_accepted": 0,
+    "acceptance": null
+   }
+  },
+  "mtp3": {
+   "gen1": {
+    "seconds": 1.413,
+    "tok_s": 90.58,
+    "predicted_per_second": 91.52717780631696,
+    "draft_n": 177,
+    "draft_n_accepted": 67
+   },
+   "gen4": {
+    "wall_seconds": 3.255,
+    "aggregate_tok_s": 157.3,
+    "draft_n": 729,
+    "draft_n_accepted": 261,
+    "acceptance": 0.358
+   }
+  }
+ },
+ "note": "MTP acceptance ~0.36 on this 0.8B model in both upstream and kobold; MTP is slower than no-MTP here in both. Upstream llama-server uses -np 4 slots for both its 1-request and 4-request runs."
+}
