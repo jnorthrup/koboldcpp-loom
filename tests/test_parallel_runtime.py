@@ -32,6 +32,7 @@ SLOTS = 4
 DRAFT = 3
 LONG_N = 1200
 EVIDENCE = {}
+HTTP_TIMEOUT = int(os.environ.get("KCPP_TEST_HTTP_TIMEOUT", "600"))
 
 
 def _free_port():
@@ -85,7 +86,8 @@ class Server:
         if getattr(self, "log", None):
             self.log.close()
 
-    def _req(self, method, path, obj=None, timeout=600):
+    def _req(self, method, path, obj=None, timeout=None):
+        timeout = HTTP_TIMEOUT if timeout is None else timeout
         data = None if obj is None else json.dumps(obj).encode()
         req = urllib.request.Request("http://127.0.0.1:%d%s" % (self.port, path), data=data, method=method)
         req.add_header("Content-Type", "application/json")
@@ -103,7 +105,7 @@ class Server:
     def get(self, path, timeout=60):
         return self._req("GET", path, None, timeout)
 
-    def post(self, path, obj, timeout=600):
+    def post(self, path, obj, timeout=None):
         return self._req("POST", path, obj, timeout)
 
     def runtime(self):
