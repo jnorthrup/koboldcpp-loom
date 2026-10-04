@@ -10,14 +10,18 @@ Asserts, with --parallelrequests 2:
   - with KCPP_TEST_DRAFT the draft/MTP sequence state travels too (envelope has a draft section) and the
     imported run reproduces text and draft counters
   - a kind=ctx envelope is refused by the seq path and a kind=seq envelope by the ctx path (bad_kind)
+  - simultaneous exports of two distinct cached slots retain each slot's exact envelope
   - a different --quantkv is refused track_mismatch with the lane left working
   - a recurrent/hybrid model refuses explicitly (unsupported_model) when KCPP_TEST_EXPECT_UNSUPPORTED=1
 Writes evidence-loomstate-seq.json to KCPP_TEST_OUT.
 """
+import concurrent.futures
+import hashlib
 import json
 import os
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 
@@ -80,10 +84,49 @@ def export_any(srv):
     return None, last
 
 
+def concurrent_exports(srv, envelopes):
+    expected = []
+    for slot, envelope in enumerate(envelopes):
+        st, body = raw(srv, "POST", "/api/admin/import_state?lane=parallel&slot=%d" % slot,
+                       envelope, "application/octet-stream")
+        check("prepare concurrent export slot %d" % slot, st == 200, (st, body[:160]))
+        if st != 200:
+            return
+        st, body = raw(srv, "POST", "/api/admin/export_state?lane=parallel",
+                       json.dumps({"slot": slot}).encode())
+        check("baseline concurrent export slot %d" % slot, st == 200 and body[:8] == b"LOOMKV01", (st, body[:80]))
+        if st != 200 or body[:8] != b"LOOMKV01":
+            return
+        expected.append(body)
+    check("concurrent export snapshots differ", expected[0] != expected[1])
+    if expected[0] == expected[1]:
+        return
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        for round_no in range(4):
+            barrier = threading.Barrier(4)
+            def export(slot):
+                barrier.wait(timeout=30)
+                return raw(srv, "POST", "/api/admin/export_state?lane=parallel",
+                           json.dumps({"slot": slot}).encode())
+            pending = [(slot, pool.submit(export, slot)) for slot in (0, 1, 0, 1)]
+            for request_no, (slot, future) in enumerate(pending):
+                name = "concurrent export round %d request %d preserves slot %d" % (round_no, request_no, slot)
+                try:
+                    st, body = future.result()
+                    same = st == 200 and body == expected[slot]
+                    check(name, same, {"status": st, "bytes": len(body), "sha256": hashlib.sha256(body).hexdigest()})
+                    completed += int(same)
+                except Exception as error:
+                    check(name, False, type(error).__name__)
+    EVIDENCE["concurrent_export_requests"] = 16
+    EVIDENCE["concurrent_exports_exact"] = completed
+
+
 def main():
     if not T.MODEL:
-        print("KCPP_TEST_MODEL is not set; nothing to run")
-        return 0
+        print("KCPP_TEST_MODEL is required; no runtime checks were executed", file=sys.stderr)
+        return 2
     os.makedirs(T.OUT, exist_ok=True)
     admindir = tempfile.mkdtemp(prefix="loomstate-seq-admin-", dir=T.OUT)
     a = server("loomseq_a", admindir)
@@ -101,6 +144,10 @@ def main():
         EVIDENCE["exported_slot"] = slot
         cont_prompt = PROMPT + first["text"]
         want = generate(a, cont_prompt, N2)
+        second_slot, second_env = export_any(a)
+        check("second cached state exports for concurrency test", second_slot is not None, second_env if second_slot is None else "")
+        if second_slot is None:
+            return finish()
     finally:
         a.stop()
 
@@ -111,6 +158,8 @@ def main():
         raw(s0, "POST", "/api/admin/save_state", json.dumps({"slot": 0}).encode())
         st, ctxenv = raw(s0, "POST", "/api/admin/export_state?lane=serial", json.dumps({"slot": 0}).encode())
         check("serial-lane ctx export works in its own process", st == 200 and ctxenv[:8] == b"LOOMKV01", (st, ctxenv[:80]))
+        st, body = raw(s0, "POST", "/api/admin/import_state?lane=serial&slot=0&load=1", env, "application/octet-stream")
+        check("ctx path refuses a seq envelope", st == 422 and json.loads(body).get("code") == "bad_kind", (st, body))
     finally:
         s0.stop()
 
@@ -138,14 +187,13 @@ def main():
             EVIDENCE["draft"] = [got.get("draft_tokens"), got.get("draft_accepted")]
         st, body = raw(b, "POST", "/api/admin/import_state?lane=parallel&slot=1", ctxenv, "application/octet-stream")
         check("seq path refuses a ctx envelope", st == 422 and json.loads(body).get("code") == "bad_kind", (st, body))
-        st, body = raw(b, "POST", "/api/admin/import_state?lane=serial&slot=0&load=1", env, "application/octet-stream")
-        check("ctx path refuses a seq envelope", st == 422 and json.loads(body).get("code") == "bad_kind", (st, body))
         bad = bytearray(env)
         bad[-1] ^= 1
         st, body = raw(b, "POST", "/api/admin/import_state?lane=parallel&slot=1", bytes(bad), "application/octet-stream")
         check("corrupted seq envelope rejected", st == 422 and json.loads(body).get("code") == "digest_mismatch", (st, body))
         st, body = raw(b, "POST", "/api/admin/import_state?lane=parallel&slot=9", env, "application/octet-stream")
         check("out-of-range slot rejected", st == 400 and json.loads(body).get("code") == "bad_slot", (st, body))
+        concurrent_exports(b, (env, second_env))
         check("lane healthy after refusals", len(generate(b, "Hello", 4)["text"]) > 0)
     finally:
         b.stop()

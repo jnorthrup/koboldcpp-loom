@@ -9237,7 +9237,10 @@ struct BatchSlotStaging
     std::vector<uint8_t> main_kv, draft_kv;
     std::vector<int32_t> tokens;
 };
-static BatchSlotStaging batch_slot_staging;
+//The synchronous HTTP handler calls begin/copy/end on the same OS thread.
+//Keep detached export buffers per handler thread: another export may begin or
+//finish after batch_mutex is released, but must not overwrite/free these bytes.
+static thread_local BatchSlotStaging batch_slot_staging;
 static int batch_slot_idle_locked(int slot)
 {
     if(!gpttype_batch_generate_enabled())
