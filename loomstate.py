@@ -27,6 +27,10 @@ VERSION = 1
 # Identity fields that must match exactly for an import to be accepted.
 TRACK_FIELDS = ("model_sha256", "kv_type_k", "kv_type_v", "n_ctx", "engine", "backend", "arch")
 STATE_CLASSES = ("prefix", "session")  # immutable shared prefix vs private continuation
+# Payload format. "ctx" = whole-context llama_state_get_data dump (SmartCache slot, serial lane, one per envelope).
+# "seq" = llama_state_seq_get_data_ext of one sequence (parallel-lane slot). The two byte layouts are not
+# interchangeable, so an importer states which it accepts.
+KINDS = ("ctx", "seq")
 
 
 class LoomStateError(Exception):
@@ -149,7 +153,7 @@ def file_sha256(path, chunk=1 << 22):
     return h.hexdigest()
 
 
-def build_envelope(track, tokens, sections, state_class="session", parent_sha256=None):
+def build_envelope(track, tokens, sections, state_class="session", parent_sha256=None, kind="ctx"):
     """track: dict with TRACK_FIELDS. sections: ordered list of (name, bytes), e.g.
     [("main", ..), ("draft", ..), ("logits", ..)]. Returns the full envelope bytes."""
     missing = [f for f in TRACK_FIELDS if f not in track]
@@ -157,10 +161,13 @@ def build_envelope(track, tokens, sections, state_class="session", parent_sha256
         raise LoomStateError("bad_track", "track is missing %s" % ", ".join(missing))
     if state_class not in STATE_CLASSES:
         raise LoomStateError("bad_class", "unknown state class %r" % state_class)
+    if kind not in KINDS:
+        raise LoomStateError("bad_kind", "unknown payload kind %r" % kind)
     desc = {
         "magic": MAGIC.decode(),
         "version": VERSION,
         "class": state_class,
+        "kind": kind,
         "track": {f: track[f] for f in TRACK_FIELDS},
         "n_tokens": len(tokens),
         "tokens_sha256": sha256_hex(struct.pack(">%dI" % len(tokens), *[t & 0xFFFFFFFF for t in tokens])),
@@ -172,7 +179,7 @@ def build_envelope(track, tokens, sections, state_class="session", parent_sha256
     return MAGIC + struct.pack(">I", len(dbytes)) + dbytes + b"".join(b for _, b in sections)
 
 
-def parse_envelope(data, local_track, accept_classes=STATE_CLASSES, expected_parent_sha256=None):
+def parse_envelope(data, local_track, accept_classes=STATE_CLASSES, expected_parent_sha256=None, accept_kinds=KINDS):
     """Verify and split an envelope. Raises LoomStateError(code, msg) on any mismatch; never
     returns partial results. Returns (descriptor, {section_name: bytes}, descriptor_bytes)."""
     if len(data) < 12 or data[:8] != MAGIC:
@@ -190,6 +197,8 @@ def parse_envelope(data, local_track, accept_classes=STATE_CLASSES, expected_par
         raise LoomStateError("bad_version", "unsupported envelope version %r" % desc.get("version"))
     if desc.get("class") not in accept_classes:
         raise LoomStateError("bad_class", "state class %r not accepted here" % desc.get("class"))
+    if desc.get("kind") not in accept_kinds:
+        raise LoomStateError("bad_kind", "payload kind %r not accepted here (this path takes %s)" % (desc.get("kind"), "/".join(accept_kinds)))
     track = desc.get("track") or {}
     for f in TRACK_FIELDS:
         if track.get(f) != local_track.get(f):

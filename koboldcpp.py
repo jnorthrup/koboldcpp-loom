@@ -1083,6 +1083,14 @@ def init_library():
                                          ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
     handle.state_slot_import.restype = ctypes.c_bool
     handle.state_arch.restype = ctypes.c_char_p
+    handle.batch_slot_export_begin.argtypes = [ctypes.c_int, ctypes.c_void_p]
+    handle.batch_slot_export_begin.restype = ctypes.c_int
+    handle.batch_slot_export_copy.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+    handle.batch_slot_export_copy.restype = ctypes.c_size_t
+    handle.batch_slot_export_end.restype = None
+    handle.batch_slot_import.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
+    handle.batch_slot_import.restype = ctypes.c_int
+    handle.batch_slot_count.restype = ctypes.c_int
     handle.sd_load_model.argtypes = [sd_load_model_inputs]
     handle.sd_load_model.restype = ctypes.c_bool
     handle.sd_generate.argtypes = [sd_generation_inputs]
@@ -1658,7 +1666,7 @@ def loomstate_export(slot, state_class="session"):
 def loomstate_import(slot, data, load=False, expected_parent_sha256=None):
     """Verify first, then hand to the engine. Returns (n_tokens, loaded)."""
     import loomstate
-    desc, secs, _ = loomstate.parse_envelope(data, loomstate_track(), expected_parent_sha256=expected_parent_sha256)
+    desc, secs, _ = loomstate.parse_envelope(data, loomstate_track(), expected_parent_sha256=expected_parent_sha256, accept_kinds=("ctx",))
     toks = desc["tokens"]
     tarr = (ctypes.c_int32 * max(len(toks), 1))(*toks)
     main, draft, logits = secs.get("main", b""), secs.get("draft", b""), secs.get("logits", b"")
@@ -1670,6 +1678,46 @@ def loomstate_import(slot, data, load=False, expected_parent_sha256=None):
     if load and not loaded:
         raise loomstate.LoomStateError("load_failed", "llama.cpp refused the imported state")
     return len(toks), loaded
+
+LOOMSTATE_SEQ_ERRORS = {-1: ("parallel_off", 409, "parallel lane is not enabled"), -2: ("bad_slot", 400, "slot out of range"),
+                        -3: ("busy", 503, "slot or engine has live work; export/import only runs on an idle slot"),
+                        -4: ("empty_slot", 409, "slot holds no reusable cached sequence"), -5: ("engine_refused", 422, "engine rejected the sequence state"),
+                        -6: ("draft_mismatch", 422, "draft/MTP sequence state does not match this engine's draft head"),
+                        -7: ("unsupported_model", 409, "this model's memory cannot resume cached sequences in the parallel lane; use the SmartCache (kind=ctx) path")}
+
+def loomstate_seq_export(slot, state_class="session"):
+    import loomstate
+    sizes = (ctypes.c_size_t * 3)()
+    rc = handle.batch_slot_export_begin(slot, ctypes.addressof(sizes))
+    if rc != 0:
+        code, _, msg = LOOMSTATE_SEQ_ERRORS.get(rc, ("export_failed", 500, "export failed (%d)" % rc))
+        raise loomstate.LoomStateError(code, msg)
+    try:
+        blobs = []
+        for w in range(3):
+            n = sizes[w]
+            buf = ctypes.create_string_buffer(max(n, 1))
+            if n and handle.batch_slot_export_copy(w, ctypes.addressof(buf), n) != n:
+                raise loomstate.LoomStateError("export_failed", "section %d copy failed" % w)
+            blobs.append(buf.raw[:n])
+    finally:
+        handle.batch_slot_export_end()
+    tokens = list(struct.unpack("<%di" % (len(blobs[2]) // 4), blobs[2]))
+    sections = [("main", blobs[0])] + ([("draft", blobs[1])] if blobs[1] else [])
+    return loomstate.build_envelope(loomstate_track(), tokens, sections, state_class=state_class, kind="seq")
+
+def loomstate_seq_import(slot, data, expected_parent_sha256=None):
+    import loomstate
+    desc, secs, _ = loomstate.parse_envelope(data, loomstate_track(), expected_parent_sha256=expected_parent_sha256, accept_kinds=("seq",))
+    toks = desc["tokens"]
+    tarr = (ctypes.c_int32 * max(len(toks), 1))(*toks)
+    main, draft = secs.get("main", b""), secs.get("draft", b"")
+    mb, db = ctypes.create_string_buffer(main, max(len(main), 1)), ctypes.create_string_buffer(draft, max(len(draft), 1))
+    rc = handle.batch_slot_import(slot, ctypes.addressof(tarr), len(toks), ctypes.addressof(mb), len(main), ctypes.addressof(db), len(draft))
+    if rc != 0:
+        code, _, msg = LOOMSTATE_SEQ_ERRORS.get(rc, ("engine_refused", 422, "import failed (%d)" % rc))
+        raise loomstate.LoomStateError(code, msg)
+    return len(toks)
 
 def loomstate_dispatch(handler, clean_path, body):
     """/api/admin/export_state and /api/admin/import_state (LOOMKV01 envelopes). Returns True when handled."""
@@ -1686,34 +1734,58 @@ def loomstate_dispatch(handler, clean_path, body):
         return True
     if not (args.admin and args.admindir and os.path.exists(args.admindir) and handler.check_header_password(args.adminpassword)):
         return reply(401, {"success": False, "error": "admin access required"})
+    lane = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query).get("lane", [None])[0]
+    if lane is None and body and clean_path.endswith("export_state"):
+        try:
+            lane = (json.loads(body) or {}).get("lane")
+        except Exception:
+            lane = None
+    if lane is None:
+        lane = "parallel" if parallel_lane_enabled() else "serial"
+    if lane == "parallel":
+        if not parallel_lane_enabled():
+            return reply(409, {"success": False, "code": "parallel_off", "error": "parallel lane is not enabled"})
+        #the parallel worker owns the engine while requests are live; the engine call checks idleness under its own mutex
+        return loomstate_handle(handler, clean_path, body, reply, parallel=True)
     if savestate_limit <= 0:
         return reply(409, {"success": False, "code": "no_slots", "error": "state export needs --smartcache slots"})
-    if batched_request_runner_count > 0 or not modelbusy.acquire(timeout=5): #a finished request releases the lock just after its response is sent
+    deadline = time.time() + 5
+    while batched_request_runner_count > 0 and time.time() < deadline: #parallel runners decrement just after their response is sent
+        time.sleep(0.02)
+    if batched_request_runner_count > 0 or not modelbusy.acquire(timeout=max(0.0, deadline - time.time())): #a finished request releases the lock just after its response is sent
         return reply(503, {"success": False, "code": "busy", "error": "model is busy; export/import only runs on an idle engine"})
     try:
         return loomstate_handle(handler, clean_path, body, reply)
     finally:
         modelbusy.release()
 
-def loomstate_handle(handler, clean_path, body, reply):
+def loomstate_handle(handler, clean_path, body, reply, parallel=False):
     import loomstate
     query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
     try:
         if clean_path.endswith("export_state"):
             req = json.loads(body) if body else {}
             slot = int(req.get("slot", 0)) if isinstance(req, dict) else 0
-            if not 0 <= slot < savestate_limit:
+            nslots = handle.batch_slot_count() if parallel else savestate_limit
+            if not 0 <= slot < nslots:
                 return reply(400, {"success": False, "code": "bad_slot", "error": "slot out of range"})
+            if parallel:
+                return reply(200, loomstate_seq_export(slot, state_class=(req.get("class", "session") if isinstance(req, dict) else "session")), 'application/octet-stream')
             env = loomstate_export(slot, state_class=(req.get("class", "session") if isinstance(req, dict) else "session"))
             return reply(200, env, 'application/octet-stream')
         slot = int(query.get("slot", ["0"])[0])
-        if not 0 <= slot < savestate_limit:
+        nslots = handle.batch_slot_count() if parallel else savestate_limit
+        if not 0 <= slot < nslots:
             return reply(400, {"success": False, "code": "bad_slot", "error": "slot out of range"})
+        if parallel:
+            n = loomstate_seq_import(slot, body or b"", expected_parent_sha256=(query.get("parent", [None])[0]))
+            return reply(200, {"success": True, "tokens": n, "loaded": True, "slot": slot, "lane": "parallel"})
         load = query.get("load", ["0"])[0] in ("1", "true")
         n, loaded = loomstate_import(slot, body or b"", load=load, expected_parent_sha256=(query.get("parent", [None])[0]))
         return reply(200, {"success": True, "tokens": n, "loaded": loaded, "slot": slot})
     except loomstate.LoomStateError as e:
-        return reply(422, {"success": False, "code": e.code, "error": e.msg})
+        status = {v[0]: v[1] for v in LOOMSTATE_SEQ_ERRORS.values()}.get(e.code, 422)
+        return reply(status, {"success": False, "code": e.code, "error": e.msg})
     except (ValueError, TypeError) as e:
         return reply(400, {"success": False, "code": "bad_request", "error": str(e)})
 
