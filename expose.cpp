@@ -541,6 +541,14 @@ extern "C"
     {
         return gpttype_state_slot_import(slot, tokens, n_tokens, main_kv, main_n, draft_kv, draft_n, logits, logits_n);
     }
+    int batch_slot_export_begin(int slot, size_t * sizes) { return gpttype_batch_slot_export_begin(slot, sizes); }
+    size_t batch_slot_export_copy(int which, uint8_t * dst, size_t cap) { return gpttype_batch_slot_export_copy(which, dst, cap); }
+    void batch_slot_export_end() { gpttype_batch_slot_export_end(); }
+    int batch_slot_import(int slot, const int32_t * tokens, size_t n_tokens, const uint8_t * main_kv, size_t main_n, const uint8_t * draft_kv, size_t draft_n)
+    {
+        return gpttype_batch_slot_import(slot, tokens, n_tokens, main_kv, main_n, draft_kv, draft_n);
+    }
+    int batch_slot_count() { return gpttype_batch_slot_count(); }
     const char * state_arch()
     {
         static std::string arch;

@@ -9225,6 +9225,136 @@ bool gpttype_state_slot_import(int slot, const int32_t * tokens, size_t n_tokens
     touch_slot(slot);
     return true;
 }
+//LOOMKV, parallel lane: per-sequence export/import of one idle slot (llama_state_seq_*). Only slots that keep a reusable
+//cached prefix (batch_fastforward) have anything to move; recurrent/hybrid memory cannot resume a sequence from a
+//cached prefix in this lane, so those models refuse explicitly (SmartCache export on the serial lane covers them).
+//Status: 0 ok, -1 parallel lane off, -2 bad slot, -3 busy (live request, serial lane active, or slot in use),
+//-4 nothing to move, -5 engine refused, -6 draft state mismatch, -7 model cannot resume cached sequences.
+//All llama calls run under batch_mutex, which the worker needs to claim a slot, and only while nothing is live,
+//so no decode overlaps them.
+struct BatchSlotStaging
+{
+    std::vector<uint8_t> main_kv, draft_kv;
+    std::vector<int32_t> tokens;
+};
+//The synchronous HTTP handler calls begin/copy/end on the same OS thread.
+//Keep detached export buffers per handler thread: another export may begin or
+//finish after batch_mutex is released, but must not overwrite/free these bytes.
+static thread_local BatchSlotStaging batch_slot_staging;
+static int batch_slot_idle_locked(int slot)
+{
+    if(!gpttype_batch_generate_enabled())
+    {
+        return -1;
+    }
+    if(slot < 0 || slot >= (int) batch_slots.size())
+    {
+        return -2;
+    }
+    if(batch_legacy_active || batch_legacy_waiting > 0 || batch_has_live_locked() || !batch_waiting.empty() || batch_slots[slot].request_id >= 0)
+    {
+        return -3;
+    }
+    if(!batch_fastforward)
+    {
+        return -7;
+    }
+    return 0;
+}
+int gpttype_batch_slot_export_begin(int slot, size_t * sizes /*main, draft, tokens*/)
+{
+    std::lock_guard<std::mutex> lock(batch_mutex);
+    int st = batch_slot_idle_locked(slot);
+    if(st != 0)
+    {
+        return st;
+    }
+    const BatchSlot & bs = batch_slots[slot];
+    if(bs.cache_tokens.empty() || (int) bs.cache_tokens.size() != batch_seq_pos_count(llama_ctx_v4, bs.seq))
+    {
+        return -4;
+    }
+    BatchSlotStaging & g = batch_slot_staging;
+    g.main_kv.assign(llama_state_seq_get_size_ext(llama_ctx_v4, bs.seq, 0), 0);
+    if(g.main_kv.empty() || llama_state_seq_get_data_ext(llama_ctx_v4, g.main_kv.data(), g.main_kv.size(), bs.seq, 0) != g.main_kv.size())
+    {
+        g = BatchSlotStaging();
+        return -5;
+    }
+    g.draft_kv.clear();
+    if(draft_ctx)
+    {
+        g.draft_kv.assign(llama_state_seq_get_size_ext(draft_ctx, bs.seq, 0), 0);
+        if(g.draft_kv.empty() || llama_state_seq_get_data_ext(draft_ctx, g.draft_kv.data(), g.draft_kv.size(), bs.seq, 0) != g.draft_kv.size())
+        {
+            g = BatchSlotStaging();
+            return -5;
+        }
+    }
+    g.tokens.assign(bs.cache_tokens.begin(), bs.cache_tokens.end());
+    sizes[0] = g.main_kv.size();
+    sizes[1] = g.draft_kv.size();
+    sizes[2] = g.tokens.size() * sizeof(int32_t);
+    return 0;
+}
+size_t gpttype_batch_slot_export_copy(int which, uint8_t * dst, size_t cap)
+{
+    const BatchSlotStaging & g = batch_slot_staging;
+    const uint8_t * src = which == 0 ? g.main_kv.data() : which == 1 ? g.draft_kv.data() : (const uint8_t *) g.tokens.data();
+    const size_t n = which == 0 ? g.main_kv.size() : which == 1 ? g.draft_kv.size() : g.tokens.size() * sizeof(int32_t);
+    if(n == 0 || cap < n)
+    {
+        return 0;
+    }
+    memcpy(dst, src, n);
+    return n;
+}
+void gpttype_batch_slot_export_end()
+{
+    batch_slot_staging = BatchSlotStaging();
+}
+int gpttype_batch_slot_count()
+{
+    std::lock_guard<std::mutex> lock(batch_mutex);
+    return gpttype_batch_generate_enabled() ? (int) batch_slots.size() : 0;
+}
+int gpttype_batch_slot_import(int slot, const int32_t * tokens, size_t n_tokens, const uint8_t * main_kv, size_t main_n, const uint8_t * draft_kv, size_t draft_n)
+{
+    std::lock_guard<std::mutex> lock(batch_mutex);
+    int st = batch_slot_idle_locked(slot);
+    if(st != 0)
+    {
+        return st;
+    }
+    if(main_kv == nullptr || main_n == 0 || n_tokens == 0)
+    {
+        return -4;
+    }
+    if((draft_ctx != nullptr) != (draft_n > 0))
+    {
+        return -6; //local draft/MTP head needs its sequence state; importing without it (or with a foreign one) desyncs drafting
+    }
+    BatchSlot & bs = batch_slots[slot];
+    batch_seq_clear(bs.seq);
+    bs.cache_tokens.clear();
+    bool ok = llama_state_seq_set_data_ext(llama_ctx_v4, main_kv, main_n, bs.seq, 0) > 0;
+    if(ok && draft_ctx)
+    {
+        ok = llama_state_seq_set_data_ext(draft_ctx, draft_kv, draft_n, bs.seq, 0) > 0;
+    }
+    if(ok && (int) n_tokens != batch_seq_pos_count(llama_ctx_v4, bs.seq))
+    {
+        ok = false; //token list and restored positions disagree
+    }
+    if(!ok)
+    {
+        batch_seq_clear(bs.seq);
+        return -5;
+    }
+    bs.cache_tokens.assign(tokens, tokens + n_tokens);
+    bs.last_used = ++batch_use_counter;
+    return 0;
+}
 //identity strings the importer compares against the envelope track (see loomstate.py)
 std::string gpttype_state_arch()
 {
